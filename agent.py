@@ -17,9 +17,9 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from langgraph.graph import StateGraph
-from pydantic import BaseModel
+from langgraph.prebuilt import create_react_agent
 from langgraph.graph.message import add_messages
+from pydantic import BaseModel
 from tools.run_unit_tests_tool import run_unit_tests
 from tools.advanced_file_read import AdvancedFileReadTool
 from tools.file_write import FileWriteTool
@@ -97,31 +97,11 @@ class Agent:
         )
         self.logger = logging.getLogger('Agent')
 
-        # Build workflow graph
-        self.workflow = StateGraph(AgentState)
-
-        # Register nodes
-        self.workflow.add_node("user_input", self.user_input)
-        self.workflow.add_node("model_response", self.model_response)
-        self.workflow.add_node("tool_use", self.tool_use)
-
-        # Edges: start at user_input
-        self.workflow.set_entry_point("user_input")
-        self.workflow.add_edge("user_input", "model_response")
-        self.workflow.add_edge("tool_use", "model_response")
-
-        # Conditional: model_response -> tool_use OR -> user_input
-        self.workflow.add_conditional_edges(
-            "model_response",
-            self.check_tool_use,
-            {
-                "tool_use": "tool_use",
-                "user_input": "user_input",
-            },
-        )
+        # Agent will be created in initialize() with tools
+        self.agent = None
 
     async def initialize(self):
-        """Async initialization - load tools and other async resources"""
+        """Async initialization - load tools and create agent"""
         if self._initialized:
             return self
 
@@ -174,14 +154,53 @@ class Agent:
         print(f"✅ Loaded {len(self.tools)} total tools (Local: {len(local_tools)} + MCP: {len(mcp_tools)})")
         self._initialized = True
 
-        # Bind tools to model
-        self.model_with_tools = self.model.bind_tools(self.tools)
+        # Build system prompt
+        system_prompt = """You are a specialised agent for maintaining and developing codebases.
+## Development Guidelines:
 
-        # Compile graph
+1. **Test Failures:**
+- When tests fail, fix the implementation first, not the tests.
+- Tests represent expected behavior; implementation should conform to tests
+- Only modify tests if they clearly don't match specifications
+
+2. **Code Changes:**
+- Make the smallest possible changes to fix issues
+- Focus on fixing the specific problem rather than rewriting large portions
+- Add unit tests for all new functionality before implementing it
+
+3. **Best Practices:**
+- Keep functions small with a single responsibility
+- Implement proper error handling with appropriate exceptions
+- Be mindful of configuration dependencies in tests
+
+4. **Safety:**
+- Use safe_run_command instead of run_command for safer execution
+- Use safe_code_edit instead of code_edit for automatic backup
+- Use rollback tool to undo changes if something goes wrong
+- Use index_codebase + code_search to understand codebase before making changes
+- Use agent_memory to save important context for future sessions
+
+Ask for clarification when needed. Remember to examine test failure messages carefully to understand the root cause before making any changes."""
+
+        # 加载记忆上下文
+        memory_context = self._build_memory_context()
+        if memory_context:
+            system_prompt += f"\n\n## Session Context:\n{memory_context}"
+
+        # Create agent using create_react_agent - 简洁的 Agent API
+        self.agent = create_react_agent(
+            model=self.model,
+            tools=self.tools,
+            state_modifier=system_prompt,
+        )
+
+        # Setup checkpointer for persistence
         db_path = os.path.join(os.getcwd(), "checkpoints.db")
         self._checkpointer_ctx = AsyncSqliteSaver.from_conn_string(db_path)
         self.checkpointer = await self._checkpointer_ctx.__aenter__()
-        self.agent = self.workflow.compile(checkpointer=self.checkpointer)
+        
+        # Compile with checkpointer
+        self.agent.checkpointer = self.checkpointer
 
         # Optional: print a greeting panel
         self.console.print(
@@ -203,7 +222,7 @@ class Agent:
 
     async def run(self):
         """
-        Main loop: invoke the workflow repeatedly, never exits automatically.
+        Main loop: invoke the agent repeatedly, never exits automatically.
         """
         config = {"configurable": {"thread_id": "1"}}
         
@@ -212,14 +231,83 @@ class Agent:
         self.logger.info("Agent 会话开始")
         
         try:
-            return await self.agent.ainvoke({"messages": AIMessage(content="What can I do for you?")}, config=config)
+            while True:
+                # Get user input
+                self.console.print("[bold cyan]User Input[/bold cyan]: ")
+                user_input = self.console.input("> ")
+                
+                # 处理特殊命令
+                if user_input.startswith("/"):
+                    special_response = self._handle_special_command(user_input)
+                    if special_response:
+                        self.console.print(
+                            Panel.fit(
+                                Markdown(special_response),
+                                title="[bold yellow]Command Result[/bold yellow]",
+                                border_style="yellow",
+                            )
+                        )
+                        continue
+                
+                # 记录对话
+                self.memory.add_conversation("main", "user", user_input)
+                
+                # Invoke agent with user message
+                response = await self.agent.ainvoke(
+                    {"messages": [HumanMessage(content=user_input)]},
+                    config=config
+                )
+                
+                # Display assistant response
+                if "messages" in response:
+                    for msg in response["messages"]:
+                        if isinstance(msg, AIMessage):
+                            # Display text content
+                            if msg.content:
+                                if isinstance(msg.content, list):
+                                    for item in msg.content:
+                                        if item["type"] == "text" and item.get("text"):
+                                            self.console.print(
+                                                Panel.fit(
+                                                    Markdown(item["text"]),
+                                                    title="[magenta]Assistant[/magenta]",
+                                                    border_style="magenta",
+                                                )
+                                            )
+                                else:
+                                    self.console.print(
+                                        Panel.fit(
+                                            Markdown(msg.content),
+                                            title="[magenta]Assistant[/magenta]",
+                                            border_style="magenta",
+                                        )
+                                    )
+                            
+                            # Display tool calls
+                            if msg.tool_calls:
+                                for tc in msg.tool_calls:
+                                    self.console.print(
+                                        Panel.fit(
+                                            Markdown(f'{tc["name"]} with args {tc.get("args", None)}'),
+                                            title="Tool Use",
+                                        )
+                                    )
+                        elif isinstance(msg, ToolMessage):
+                            # Display tool results
+                            self.console.print(
+                                Panel.fit(
+                                    Syntax("\n" + msg.content + "\n", "text"),
+                                    title=f"Tool Result",
+                                )
+                            )
+        
         finally:
             # 记录会话结束
             self.memory.add_conversation("main", "system", "会话结束")
             self.logger.info("Agent 会话结束")
     
     def _build_memory_context(self) -> str:
-        """构建记忆上下文，注入到 system prompt"""
+        """构建记忆上下文,注入到 system prompt"""
         context_parts = []
         
         try:
@@ -288,27 +376,6 @@ class Agent:
                 "transport": "stdio",
             }
 
-        # Add Python Run MCP (commented out as it's slow to initialize)
-        # Uncomment if you need Python execution capability
-        # mcp_configs["Run_Python_MCP"] = {
-        #     "command": "docker",
-        #     "args": [
-        #         "run",
-        #         "-i",
-        #         "--rm",
-        #         "deno-docker:latest",
-        #         "deno",
-        #         "run",
-        #         "-N",
-        #         "-R=node_modules",
-        #         "-W=node_modules",
-        #         "--node-modules-dir=auto",
-        #         "jsr:@pydantic/mcp-run-python",
-        #         "stdio",
-        #     ],
-        #     "transport": "stdio",
-        # }
-
         mcp_tools = []
 
         # Load MCP tools one by one to avoid resource conflicts
@@ -333,26 +400,6 @@ class Agent:
             print(f"MCP 🔧 {tb.name}")
         return mcp_tools
 
-    # Node: user_input
-    def user_input(self, state: AgentState) -> AgentState:
-        """
-        Ask user for input and append HumanMessage to state.
-        Supports special commands starting with '/'.
-        """
-        self.console.print("[bold cyan]User Input[/bold cyan]: ")
-        user_input = self.console.input("> ")
-        
-        # 处理特殊命令
-        if user_input.startswith("/"):
-            special_response = self._handle_special_command(user_input)
-            if special_response:
-                return {"messages": [HumanMessage(content=special_response)]}
-        
-        # 记录对话
-        self.memory.add_conversation("main", "user", user_input)
-        
-        return {"messages": [HumanMessage(content=user_input)]}
-    
     def _handle_special_command(self, command: str) -> str:
         """处理特殊命令"""
         cmd = command.strip().lower()
@@ -416,244 +463,3 @@ class Agent:
                    "  /help            - Show this help")
         
         return None
-
-    # Node: model_response
-    def model_response(self, state: AgentState) -> AgentState:
-        """
-        Call the LLM (with tools bound). Print assistant content and any tool_call previews.
-        Decide routing via check_tool_use.
-        """
-        system_text = """You are a specialised agent for maintaining and developing codebases.
-            ## Development Guidelines:
-
-            1. **Test Failures:**
-            - When tests fail, fix the implementation first, not the tests.
-            - Tests represent expected behavior; implementation should conform to tests
-            - Only modify tests if they clearly don't match specifications
-
-            2. **Code Changes:**
-            - Make the smallest possible changes to fix issues
-            - Focus on fixing the specific problem rather than rewriting large portions
-            - Add unit tests for all new functionality before implementing it
-
-            3. **Best Practices:**
-            - Keep functions small with a single responsibility
-            - Implement proper error handling with appropriate exceptions
-            - Be mindful of configuration dependencies in tests
-
-            4. **Safety:**
-            - Use safe_run_command instead of run_command for safer execution
-            - Use safe_code_edit instead of code_edit for automatic backup
-            - Use rollback tool to undo changes if something goes wrong
-            - Use index_codebase + code_search to understand codebase before making changes
-            - Use agent_memory to save important context for future sessions
-
-            Ask for clarification when needed. Remember to examine test failure messages carefully to understand the root cause before making any changes."""
-        
-        # 加载记忆上下文
-        memory_context = self._build_memory_context()
-        if memory_context:
-            system_text += f"\n\n## Session Context:\n{memory_context}"
-        
-        # Compose messages: include prior state
-        messages = [
-            SystemMessage(
-                content=[
-                    {
-                        "type": "text",
-                        "text": system_text,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ]
-            ),
-            HumanMessage(content=f"Working directory: {os.getcwd()}"),
-        ] + state.messages
-
-        # Invoke model
-        response = self.model_with_tools.invoke(messages)
-        if isinstance(response.content, list):
-            for item in response.content:
-                if item["type"] == "text":
-                    text = item.get("text", "")
-                    if text:
-                        self.console.print(
-                            Panel.fit(
-                                Markdown(text),
-                                title="[magenta]Assistant[/magenta]",
-                                border_style="magenta",
-                            )
-                        )
-                elif item["type"] == "tool_use":
-                    self.console.print(
-                        Panel.fit(
-                            Markdown(f'{item["name"]} with args {item.get("args",None)}'),
-                            title="Tool Use",
-                        )
-                    )
-        else:
-            self.console.print(
-                Panel.fit(
-                    Markdown(response.content),
-                    title="[magenta]Assistant[/magenta]",
-                )
-            )
-
-        return {"messages": [response]}
-
-    # Conditional router
-    def check_tool_use(self, state: AgentState) -> str:
-        """
-        If the last assistant message has tool_calls, route to 'tool_use', else route to 'user_input'.
-        """
-        if state.messages[-1].tool_calls:
-            return "tool_use"
-        return "user_input"
-
-    # Node: tool_use
-    async def tool_use(self, state: AgentState) -> AgentState:
-        """
-        Execute tool calls from the last assistant message and return ToolMessage(s),
-        preserving tool_call_id so the model can reconcile results when we go back to model_response.
-        支持并行执行和自动重试。
-        """
-        from langgraph.prebuilt import ToolNode
-
-        response = []
-        tools_by_name = {t.name: t for t in self.tools}
-
-        # 定义需要确认的危险操作
-        DANGEROUS_TOOLS = {"run_command", "code_edit", "file_write"}
-        
-        # 收集需要执行的工具调用
-        tool_calls_to_execute = []
-        for tc in state.messages[-1].tool_calls:
-            tool_name = tc["name"]
-            tool_args = tc["args"]
-            
-            # 安全检查：危险操作需要用户确认
-            if tool_name in DANGEROUS_TOOLS:
-                self.console.print(
-                    Panel.fit(
-                        Markdown(f"**⚠️ 危险操作确认**\n\n工具: `{tool_name}`\n\n参数:\n```json\n{tool_args}\n```\n\n是否继续执行？"),
-                        title="安全警告",
-                        border_style="yellow",
-                    )
-                )
-                user_confirm = self.console.input("[bold yellow]输入 'y' 或 'yes' 继续，其他键取消: [/bold yellow]")
-                if user_confirm.lower() not in ['y', 'yes']:
-                    self.console.print("[red]❌ 操作已取消[/red]")
-                    response.append(
-                        ToolMessage(
-                            content=f"操作被用户取消",
-                            tool_call_id=tc["id"],
-                        )
-                    )
-                    continue
-            
-            tool_calls_to_execute.append(tc)
-        
-        # 并行执行独立工具调用
-        if len(tool_calls_to_execute) > 1:
-            self.logger.info(f"并行执行 {len(tool_calls_to_execute)} 个工具调用")
-            
-            # 创建异步任务
-            tasks = [
-                self._execute_single_tool(tool_call, tools_by_name, state)
-                for tool_call in tool_calls_to_execute
-            ]
-            
-            # 等待所有任务完成
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # 收集结果
-            for result in results:
-                if isinstance(result, Exception):
-                    self.logger.error(f"工具执行异常: {result}")
-                    response.append(
-                        ToolMessage(
-                            content=f"ERROR: {str(result)}",
-                            tool_call_id="unknown",
-                        )
-                    )
-                else:
-                    response.append(result)
-        else:
-            # 单个工具调用，顺序执行
-            for tc in tool_calls_to_execute:
-                result = await self._execute_single_tool(tc, tools_by_name, state)
-                response.append(result)
-        
-        return {"messages": response}
-    
-    async def _execute_single_tool(self, tc: dict, tools_by_name: dict, state: AgentState, max_retries: int = 2) -> ToolMessage:
-        """执行单个工具调用，支持自动重试"""
-        tool_name = tc["name"]
-        tool_args = tc["args"]
-        
-        for attempt in range(max_retries + 1):
-            try:
-                start_time = time.time()
-                self.logger.info(f"执行工具 {tool_name} (尝试 {attempt + 1}/{max_retries + 1})")
-                
-                from langgraph.prebuilt import ToolNode
-                tool = tools_by_name.get(tool_name)
-                tool_node = ToolNode([tool])
-                
-                tool_result = await tool_node.ainvoke(state)
-                execution_time = time.time() - start_time
-                
-                # 记录成功
-                self.operation_logger.log(tool_name, {"args": tool_args}, success=True)
-                self.memory.record_tool_usage(tool_name, success=True, execution_time=execution_time)
-                
-                result_msg = tool_result["messages"][0]
-                
-                # 显示结果
-                self.console.print(
-                    Panel.fit(
-                        Syntax("\n" + result_msg.content + "\n", "text"),
-                        title=f"Tool Result ({tool_name})",
-                    )
-                )
-                
-                return result_msg
-                
-            except Exception as e:
-                self.logger.error(f"工具 {tool_name} 执行失败 (尝试 {attempt + 1}): {e}")
-                
-                if attempt < max_retries:
-                    # 等待后重试
-                    wait_time = 2 ** attempt
-                    self.console.print(f"[yellow]⚠️ 工具 {tool_name} 执行失败，{wait_time}秒后重试...[/yellow]")
-                    await asyncio.sleep(wait_time)
-                else:
-                    # 所有重试失败
-                    self.operation_logger.log(tool_name, {"args": tool_args, "error": str(e)}, success=False)
-                    self.memory.record_tool_usage(tool_name, success=False, execution_time=0)
-                    
-                    return ToolMessage(
-                        content=f"ERROR: 工具 '{tool_name}' 执行失败（已重试{max_retries}次）: {e}",
-                        tool_call_id=tc["id"],
-                    )
-
-    def print_mermaid_workflow(self):
-        """
-        Utility: print Mermaid diagram to visualize the graph edges.
-        """
-        try:
-            mermaid = self.agent.get_graph().draw_mermaid_png(
-                output_file_path="langgraph_workflow.png",
-                max_retries=5,
-                retry_delay=2,
-            )
-        except Exception as e:
-            print(f"Error generating mermaid PNG: {e}")
-            mermaid = self.agent.get_graph().draw_mermaid()
-            self.console.print(
-                Panel.fit(
-                    Syntax(mermaid, "mermaid", theme="monokai", line_numbers=False),
-                    title="Workflow (Mermaid)",
-                    border_style="cyan",
-                )
-            )
-            print(self.agent.get_graph().draw_ascii())
