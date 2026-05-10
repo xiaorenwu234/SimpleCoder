@@ -21,7 +21,7 @@ cd SimpleCoder
 使用简化版配置文件（推荐）：
 
 ```bash
-conda env create -f environment_simple.yaml
+conda env create -f environment.yaml
 ```
 
 > ⏱️ 这个过程可能需要 5-10 分钟，取决于网络速度。
