@@ -1,122 +1,181 @@
-# Claude-Code-Clone — LangGraph CLI Coding agent
+# Simple Coder - AI 编程助手
 
-A compact, runnable Python project that reconstructs a demo agent using LangGraph, LangChain and Anthropic Claude. The project provides a terminal UI (Rich), local utility tools, and support for remote MCP servers. This README focuses on getting started with uv and common workflows.
+基于 LangGraph 和 LangChain 的智能编程助手，支持代码编辑、命令执行、代码搜索、操作回滚等功能。
 
-## Key features
-- Interactive agent driven by a state graph (user input → model response → tool use → back to user).
-- Local tools: file reader and unit-test runner (Pytest wrapper).
-- MCP integrations (DesktopCommander, sandbox Python MCP, DuckDuckGo search, GitHub MCP, and a Deno Docker image).
-- Rich terminal UI and Mermaid workflow visualization.
+## 📋 环境要求
 
-## Prerequisites
-- macOS / Linux / Windows with Python 3.11+ (project uses 3.13 bytecode in cache but is compatible with 3.11+).
-- uv
-- Docker (required to build/run the provided MCP Docker images- ensure that Docker Desktop is running).
+- **Python**: 3.11 或 3.12
+- **Conda**: 用于环境管理
+- **(可选) Docker**: 用于 MCP 工具（如 DuckDuckGo 搜索、GitHub API 等）
 
-## Quick start (using uv)
-1. Initialize the uv workspace (creates .venv and metadata):
+## 🚀 快速开始
 
-   uv init
+### 1. 克隆或下载项目
 
-2. Install dependencies from requirements.txt into the uv-managed venv:
+```bash
+cd SimpleCoder
+```
 
-   uv add -r requirements.txt
+### 2. 创建 Conda 环境
 
-3. Sync uv's lock state (optional but recommended):
+使用简化版配置文件（推荐）：
 
-   uv sync
+```bash
+conda env create -f environment_simple.yaml
+```
 
-4. Activate the virtual environment created by uv (common path):
+> ⏱️ 这个过程可能需要 5-10 分钟，取决于网络速度。
 
-   source .venv/bin/activate
+### 3. 激活环境
 
-5. Run the agent CLI:
+```bash
+conda activate simple-coder
+```
 
-   uv run main.py
+### 4. 配置环境变量
 
-You can also run directly with Python if you prefer (after activating venv):
+复制环境变量模板：
 
-   python3 main.py
+```bash
+cp .env.example .env
+```
 
-## Environment variables (.env)
-Create a .env file in the project root or export env vars before running.
-Example .env:
+编辑 `.env` 文件，填入你的 API 密钥：
 
-  ANTHROPIC_API_KEY=sk-ant-...
-  GITHUB_PERSONAL_ACCESS_TOKEN=ghp_...
+```env
+# 使用通义千问（推荐，国内可用）
+DASHSCOPE_API_KEY=你的API密钥
+DASHSCOPE_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1
+MODEL_NAME=qwen-plus
+```
 
+### 5. 运行程序
 
-## Useful uv commands and examples
-- Run the main agent:
-  uv run main.py
+```bash
+python main.py
+```
 
-- Build the Deno MCP Docker image:
-  docker build -t deno-docker:latest -f ./mcps/deno/Dockerfile .
+## 🛠️ 特殊命令
 
-## Common prompts to try
-- summarize the recent articles from https://simonwillison.net/
-- use python_run_code tool to run ascii_art_generator.py
-- "Show me the content of main.py" (assuming you have exposed this to Desktop Commander MCP or enable built-in read_file tool)
-- "What tools do you have?"
-- "Read /absolute/path/to/requirements.txt"
+程序运行后，可以使用以下斜杠命令：
 
-## Available tools and MCPs
-Local tools (bundled in tools/):
-- file_read_tool.py — safely reads and returns file contents; handles permission and not-found errors. Not used because we decided to use Desktop Commander MCP instead
-- run_unit_tests_tool.py — wrapper that runs pytest and returns results.
+| 命令 | 说明 | 示例 |
+|------|------|------|
+| `/help` | 显示帮助信息 | `/help` |
+| `/rollback` | 查看操作历史 | `/rollback` |
+| `/rollback <id>` | 回退指定操作 | `/rollback 5` |
+| `/history` | 查看对话历史 | `/history` |
+| `/stats` | 查看工具使用统计 | `/stats` |
+| `/index` | 重新索引代码库 | `/index` |
 
-- Run a local tool (file reader):
-  uv run tools/file_read_tool.py -- /absolute/path/to/file.txt
+## 📦 核心功能
 
-  (The file reader will print contents and handle common file errors.)
+### 本地工具（16个）
 
-- Run unit-test runner (project provides a Pytest wrapper):
-  uv run tools/run_unit_tests_tool.py
+- ✅ **文件操作**: 读取、写入、搜索文件
+- ✅ **代码编辑**: 安全编辑（自动备份）、代码格式化、代码检查
+- ✅ **命令执行**: 安全执行命令、运行测试
+- ✅ **代码搜索**: 语义搜索、代码索引
+- ✅ **版本控制**: Git diff、操作回滚
+- ✅ **记忆系统**: 跨会话记忆、工具统计
 
-Remote MCPs (configured in repo):
-- DesktopCommander MCP
-- Pydantic AI run-python (sandbox Python MCP)
-- DuckDuckGo search MCP
-- GitHub MCP (runs as a Docker container; requires GITHUB_PERSONAL_ACCESS_TOKEN)
-    ```
-    command: docker 
-    Arguments: run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN=GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server
-    ```
+### MCP 工具（可选，需要 Docker）
 
-## Inspecting the SQLite database
-The project uses SQLite to store checkpoints. You can inspect the database using the sqlite3 command-line tool:
+- 🔍 DuckDuckGo 搜索
+- 🐙 GitHub API（只读）
 
-   sqlite3 checkpoints.db
+## ❓ 常见问题
 
-Common SQLite commands:
-- List all tables:
-  .tables
+### Q1: MCP 工具加载失败
 
-- Show table schema:
-  .schema your_table_name
+这是**正常现象**！MCP 工具需要 Docker 支持。没有 Docker 时，程序会使用本地工具继续运行。
 
-- Export query results:
-  .mode csv
-  .output results.csv
-  .headers on
-  SELECT * FROM your_table_name;
-  .output stdout
+**要启用 MCP 工具：**
 
-Exit sqlite3 with .quit or Ctrl+D
+1. 安装 Docker Desktop
+2. 启动 Docker
+3. 确保网络可以拉取 Docker 镜像
 
-## Development notes
-- The agent composes system + working-directory guidance to the Claude model. You can change model parameters in the code if you prefer a different LLM.
-- Tools are designed to return structured ToolMessages so the StateGraph can route responses back to the model correctly.
-- The terminal UI uses Rich for Markdown, code highlighting, and Mermaid output.
+## 📁 项目结构
 
-## Troubleshooting
-- uv: If `uv run` fails, ensure you ran `uv init` and `uv add -r requirements.txt`, and that you activated the .venv.
-- Missing API key: set ANTHROPIC_API_KEY in .env or export it before running.
-- Docker errors: verify Docker is running and you have permission to run docker commands.
-- Python version mismatch: use the Python version your virtual environment is created with; recreate the venv if needed.
+```
+claude_code_clone-main/
+├── agent.py                      # 主 Agent 逻辑
+├── main.py                       # 入口文件
+├── tools/                        # 工具目录
+│   ├── code_edit.py             # 代码编辑工具
+│   ├── safe_code_edit.py        # 安全代码编辑（带备份）
+│   ├── run_command.py           # 命令执行工具
+│   ├── safe_run_command.py      # 安全命令执行
+│   ├── code_search_tool.py      # 代码搜索工具
+│   ├── code_indexer.py          # 代码索引器
+│   ├── operation_rollback.py    # 操作回滚
+│   ├── agent_memory.py          # Agent 记忆系统
+│   └── ...                      # 其他工具
+├── environment_simple.yaml       # ✅ 推荐的环境配置
+├── environment_portable.yaml     # 备选环境配置
+├── .env.example                 # 环境变量模板
+└── INSTALL.md                   # 详细安装指南
+```
 
-## License
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+## 🔧 在其他电脑上安装
 
-## Security
-- This project reads files but does not execute arbitrary shell commands or user files. Review tools before trusting them with sensitive directories.
+### 方法 1: 使用 Conda（推荐）
+
+```bash
+# 1. 复制项目到新电脑
+# 2. 创建环境
+conda env create -f environment_simple.yaml
+
+# 3. 激活环境
+conda activate simple-coder
+
+# 4. 配置 .env 文件
+cp .env.example .env
+# 编辑 .env，填入 API 密钥
+
+# 5. 运行
+python main.py
+```
+
+## 📝 开发指南
+
+### 添加新工具
+
+1. 在 `tools/` 目录创建新的工具文件
+2. 实现工具类或函数
+3. 在 `agent.py` 的 `initialize()` 方法中注册工具
+
+### 调试模式
+
+```bash
+# 查看详细日志
+export LOG_LEVEL=DEBUG
+python main.py
+```
+
+## 🤝 技术支持
+
+如遇到其他问题：
+
+1. 检查 Python 版本：`python --version`（应为 3.11 或 3.12）
+2. 确认环境已激活：`conda info --envs`
+3. 检查依赖版本：`pip list | grep langchain`
+4. 查看日志文件：`cat agent.log`
+
+## 📄 许可证
+
+详见 LICENSE 文件。
+
+## 🌟 特性亮点
+
+- 🔒 **安全执行**: 沙盒环境 + 自动备份
+- 🔄 **操作回滚**: 支持撤销任何文件修改
+- 🔍 **智能搜索**: 代码索引 + 语义搜索
+- 🧠 **持久记忆**: 跨会话保存上下文
+- 📊 **统计分析**: 工具使用统计和成功率
+- ⚡ **并行执行**: 支持并行工具调用
+
+---
+
+**祝使用愉快！** 🎉
