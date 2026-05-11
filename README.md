@@ -5,7 +5,8 @@
 ## 📋 环境要求
 
 - **Python**: 3.11 或 3.12
-- **Conda**: 用于环境管理
+- **pip**: 用于安装依赖
+- **Conda** (可选): 用于环境管理
 - **(可选) Docker**: 用于 MCP 工具（如 DuckDuckGo 搜索、GitHub API 等）
 
 ## 🚀 快速开始
@@ -16,23 +17,34 @@
 cd SimpleCoder
 ```
 
-### 2. 创建 Conda 环境
+### 2. 安装依赖
 
-使用简化版配置文件（推荐）：
+**方法 1: 使用 pip + requirements.txt（推荐）**
 
 ```bash
-conda env create -f environment.yaml
+# 确保 Python 版本为 3.11 或 3.12
+python --version
+
+# 安装所有依赖
+pip install -r requirements.txt
 ```
 
-> ⏱️ 这个过程可能需要 5-10 分钟，取决于网络速度。
+> ⏱️ 这个过程可能需要 3-5 分钟，取决于网络速度。
 
-### 3. 激活环境
+**方法 2: 使用 Conda（可选）**
 
 ```bash
+# 创建 conda 环境
+conda create -n simple-coder python=3.12
+
+# 激活环境
 conda activate simple-coder
+
+# 安装依赖
+pip install -r requirements.txt
 ```
 
-### 4. 配置环境变量
+### 3. 配置环境变量
 
 复制环境变量模板：
 
@@ -49,7 +61,7 @@ DASHSCOPE_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1
 MODEL_NAME=qwen-plus
 ```
 
-### 5. 运行程序
+### 4. 运行程序
 
 ```bash
 python main.py
@@ -112,29 +124,49 @@ claude_code_clone-main/
 │   ├── operation_rollback.py    # 操作回滚
 │   ├── agent_memory.py          # Agent 记忆系统
 │   └── ...                      # 其他工具
-├── environment_simple.yaml       # ✅ 推荐的环境配置
-├── environment_portable.yaml     # 备选环境配置
+├── requirements.txt             # ✅ Python 依赖配置
 ├── .env.example                 # 环境变量模板
 └── INSTALL.md                   # 详细安装指南
 ```
 
 ## 🔧 在其他电脑上安装
 
-### 方法 1: 使用 Conda（推荐）
+### 方法 1: 使用 pip（推荐）
 
 ```bash
 # 1. 复制项目到新电脑
-# 2. 创建环境
-conda env create -f environment_simple.yaml
+# 2. 确保 Python 3.11 或 3.12
+python --version
 
-# 3. 激活环境
-conda activate simple-coder
+# 3. 安装依赖
+pip install -r requirements.txt
 
 # 4. 配置 .env 文件
 cp .env.example .env
 # 编辑 .env，填入 API 密钥
 
 # 5. 运行
+python main.py
+```
+
+### 方法 2: 使用 Conda
+
+```bash
+# 1. 复制项目到新电脑
+# 2. 创建环境
+conda create -n simple-coder python=3.11
+
+# 3. 激活环境
+conda activate simple-coder
+
+# 4. 安装依赖
+pip install -r requirements.txt
+
+# 5. 配置 .env 文件
+cp .env.example .env
+# 编辑 .env，填入 API 密钥
+
+# 6. 运行
 python main.py
 ```
 
@@ -159,8 +191,8 @@ python main.py
 如遇到其他问题：
 
 1. 检查 Python 版本：`python --version`（应为 3.11 或 3.12）
-2. 确认环境已激活：`conda info --envs`
-3. 检查依赖版本：`pip list | grep langchain`
+2. 确认依赖已安装：`pip list | grep langchain`
+3. 检查依赖版本：`pip show langgraph`
 4. 查看日志文件：`cat agent.log`
 
 ## 📄 许可证
