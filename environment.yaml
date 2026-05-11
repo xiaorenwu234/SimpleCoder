@@ -5,18 +5,11 @@ channels:
 dependencies:
   - python>=3.11,<3.13
   - pip
-
-  - sqlite
-  - tk
-  - tzdata
-  - xz
-  - zlib
   
   - pytest>=8.0
 
   
   - pip:
-      # 只指定最低版本要求，不锁定精确版本
       - langgraph==0.2.53
       - langchain==0.3.7
       - langchain-openai==0.3.0
@@ -28,15 +21,15 @@ dependencies:
       - langsmith==0.1.147
       - langgraph-checkpoint-sqlite==2.0.11
       
-      - openai>=1.100.0
-      - anthropic>=0.39.0
-      - litellm>=1.80.0
+      - openai==1.109.1
+      - anthropic==0.39.0
+      - litellm
       
-      - mcp>=1.15.0
-      - fastmcp>=3.0.0
+      - mcp==1.24.0
+      - fastmcp==3.2.4
       
-      - aiohttp>=3.10.0
-      - aiofiles>=24.0.0
+      - aiohttp==3.13.0
+      - aiofiles==25.1.0
       - aiofile>=3.8.0
       - aiosqlite>=0.20.0
       - httpx>=0.27.0
