@@ -19,6 +19,7 @@ from langchain_core.messages import (
 )
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph.message import add_messages
+from langgraph.types import StreamWriter
 from pydantic import BaseModel
 from tools.run_unit_tests_tool import run_unit_tests
 from tools.advanced_file_read import AdvancedFileReadTool
@@ -252,54 +253,82 @@ Ask for clarification when needed. Remember to examine test failure messages car
                 # 记录对话
                 self.memory.add_conversation("main", "user", user_input)
                 
-                # Invoke agent with user message
-                response = await self.agent.ainvoke(
-                    {"messages": [HumanMessage(content=user_input)]},
-                    config=config
-                )
+                # Invoke agent with streaming for progressive output
+                self.console.print("\n[bold cyan]🤖 Processing...[/bold cyan]\n")
                 
-                # Display assistant response
-                if "messages" in response:
-                    for msg in response["messages"]:
-                        if isinstance(msg, AIMessage):
-                            # Display text content
-                            if msg.content:
-                                if isinstance(msg.content, list):
-                                    for item in msg.content:
-                                        if item["type"] == "text" and item.get("text"):
-                                            self.console.print(
-                                                Panel.fit(
-                                                    Markdown(item["text"]),
-                                                    title="[magenta]Assistant[/magenta]",
-                                                    border_style="magenta",
-                                                )
-                                            )
-                                else:
-                                    self.console.print(
-                                        Panel.fit(
-                                            Markdown(msg.content),
-                                            title="[magenta]Assistant[/magenta]",
-                                            border_style="magenta",
-                                        )
-                                    )
-                            
-                            # Display tool calls
-                            if msg.tool_calls:
-                                for tc in msg.tool_calls:
-                                    self.console.print(
-                                        Panel.fit(
-                                            Markdown(f'{tc["name"]} with args {tc.get("args", None)}'),
-                                            title="Tool Use",
-                                        )
-                                    )
-                        elif isinstance(msg, ToolMessage):
-                            # Display tool results
+                # 跟踪是否正在输出AI响应
+                assistant_output_active = False
+                
+                # 使用 astream_events 获取更详细的事件流
+                async for event in self.agent.astream_events(
+                    {"messages": [HumanMessage(content=user_input)]},
+                    config=config,
+                    version="v2"
+                ):
+                    event_type = event.get("event", "")
+                    
+                    # 处理 AI 文本流式输出
+                    if event_type == "on_chat_model_stream":
+                        chunk = event.get("data", {}).get("chunk", "")
+                        if chunk:
+                            if isinstance(chunk, AIMessage):
+                                if chunk.content and isinstance(chunk.content, str):
+                                    if chunk.content.strip():
+                                        if not assistant_output_active:
+                                            self.console.print("\n[magenta]━ Assistant Response ━[/magenta]")
+                                            assistant_output_active = True
+                                        print(chunk.content, end="", flush=True)
+                    
+                    # 处理工具调用开始
+                    elif event_type == "on_tool_start":
+                        if assistant_output_active:
+                            print()
+                            assistant_output_active = False
+                        
+                        tool_name = event.get("name", "unknown")
+                        tool_input = event.get("data", {}).get("input", {})
+                        
+                        print()  # 换行
+                        if tool_input:
+                            import json
+                            args_str = json.dumps(tool_input, indent=2, ensure_ascii=False)
                             self.console.print(
                                 Panel.fit(
-                                    Syntax("\n" + msg.content + "\n", "text"),
-                                    title=f"Tool Result",
+                                    Markdown(f'**🔧 Tool**: `{tool_name}`\n\n**Parameters**:\n```json\n{args_str}\n```'),
+                                    title="[yellow]⚡ Tool Execution[/yellow]",
+                                    border_style="yellow",
                                 )
                             )
+                        else:
+                            self.console.print(
+                                Panel.fit(
+                                    Markdown(f'**🔧 Tool**: `{tool_name}`'),
+                                    title="[yellow]⚡ Tool Execution[/yellow]",
+                                    border_style="yellow",
+                                )
+                            )
+                        print()  # 工具调用后换行
+                    
+                    # 处理工具执行完成
+                    elif event_type == "on_tool_end":
+                        print()  # 换行
+                        tool_output = event.get("data", {}).get("output", "")
+                        tool_name = event.get("name", "tool")
+                        
+                        if isinstance(tool_output, str):
+                            content_preview = tool_output[:500] if len(tool_output) > 500 else tool_output
+                            self.console.print(
+                                Panel.fit(
+                                    Syntax("\n" + content_preview + ("\n...[truncated]" if len(tool_output) > 500 else ""), "text"),
+                                    title=f"[green]✅ Tool Result: {tool_name}[/green]",
+                                    border_style="green",
+                                )
+                            )
+                        print()  # 工具结果后换行
+                
+                # 确保最后有换行
+                if assistant_output_active:
+                    print()  # 结束AI文本输出
         
         finally:
             # 记录会话结束
