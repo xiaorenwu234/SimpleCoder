@@ -161,8 +161,16 @@ class AgentMemory:
     
     # ========== 对话历史 ==========
     
+    @staticmethod
+    def _sanitize_text(text: str) -> str:
+        """清理文本中的非UTF-8字符（如surrogate字符），防止数据库写入错误"""
+        if text is None:
+            return text
+        return text.encode('utf-8', errors='replace').decode('utf-8')
+
     def add_conversation(self, session_id: str, role: str, content: str, metadata: Dict = None):
         """添加对话记录"""
+        content = self._sanitize_text(content)
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''

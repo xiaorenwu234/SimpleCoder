@@ -4,6 +4,7 @@ import os
 import asyncio
 import time
 import logging
+import readline  # 启用GNU readline行编辑，修复macOS下退格键等编辑功能失效
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
@@ -41,6 +42,8 @@ from tools.safe_code_edit import SafeCodeEditTool
 from tools.code_search_tool import CodeSearchTool, IndexCodebaseTool
 from tools.rollback_tool import RollbackTool
 from tools.memory_tool import MemoryTool
+from tools.web_search import WebSearchTool
+from tools.tracer import get_tracer, reset_tracer
 
 
 class AgentState(BaseModel):
@@ -87,6 +90,9 @@ class Agent:
         self.code_indexer = CodeIndexer()
         self.memory = AgentMemory()
         
+        # 初始化 Trace 追踪器
+        self.tracer = get_tracer()
+        
         # 设置日志
         logging.basicConfig(
             level=logging.INFO,
@@ -106,7 +112,8 @@ class Agent:
         if self._initialized:
             return self
 
-        print("🔄 Initializing agent...")
+        async with self.tracer.async_span("agent.initialize", category="init"):
+            print("🔄 Initializing agent...")
 
         # Local tools - replacing Desktop Commander MCP functionality
         local_tools = [
@@ -127,6 +134,7 @@ class Agent:
             IndexCodebaseTool(),
             RollbackTool(),
             MemoryTool(),
+            WebSearchTool(),
         ]
 
         print(f"📦 Loaded {len(local_tools)} local tools:")
@@ -137,7 +145,8 @@ class Agent:
         mcp_tools = []
         try:
             print("🔌 Attempting to load MCP tools (requires Docker)...")
-            mcp_tools = await self.get_mcp_tools()
+            async with self.tracer.async_span("mcp.load_tools", category="init"):
+                mcp_tools = await self.get_mcp_tools()
             print(f"✅ Loaded {len(mcp_tools)} MCP tools")
             for tool in mcp_tools:
                 print(f"  🔧 {tool.name}")
@@ -180,6 +189,7 @@ class Agent:
 - Use rollback tool to undo changes if something goes wrong
 - Use index_codebase + code_search to understand codebase before making changes
 - Use agent_memory to save important context for future sessions
+- Use web_search to find real-time information, documentation, or external knowledge
 
 Ask for clarification when needed. Remember to examine test failure messages carefully to understand the root cause before making any changes."""
 
@@ -188,7 +198,6 @@ Ask for clarification when needed. Remember to examine test failure messages car
         if memory_context:
             system_prompt += f"\n\n## Session Context:\n{memory_context}"
 
-        # Create agent using create_react_agent - 简洁的 Agent API
         self.agent = create_react_agent(
             model=self.model,
             tools=self.tools,
@@ -228,14 +237,19 @@ Ask for clarification when needed. Remember to examine test failure messages car
         config = {"configurable": {"thread_id": "1"}}
         
         # 记录会话开始
+        self.tracer.event("session.start", category="lifecycle")
         self.memory.add_conversation("main", "system", "会话开始")
         self.logger.info("Agent 会话开始")
+        
+        # 用于追踪工具调用的 run_id -> 开始时间
+        tool_spans: dict = {}
+        turn_count = 0
         
         try:
             while True:
                 # Get user input
                 self.console.print("[bold cyan]User Input[/bold cyan]: ")
-                user_input = self.console.input("> ")
+                user_input = input("> ")
                 
                 # 处理特殊命令
                 if user_input.startswith("/"):
@@ -250,6 +264,9 @@ Ask for clarification when needed. Remember to examine test failure messages car
                         )
                         continue
                 
+                turn_count += 1
+                turn_name = f"turn.{turn_count}"
+                
                 # 记录对话
                 self.memory.add_conversation("main", "user", user_input)
                 
@@ -258,73 +275,139 @@ Ask for clarification when needed. Remember to examine test failure messages car
                 
                 # 跟踪是否正在输出AI响应
                 assistant_output_active = False
+                llm_stream_start_ts = None
+                agent_invoke_start_ts = None  # 追踪 agent.invoke 以填补 gap
+                llm_think_start_ts = None     # 追踪工具结果→下一次LLM流之间的gap
                 
                 # 使用 astream_events 获取更详细的事件流
-                async for event in self.agent.astream_events(
-                    {"messages": [HumanMessage(content=user_input)]},
-                    config=config,
-                    version="v2"
-                ):
-                    event_type = event.get("event", "")
-                    
-                    # 处理 AI 文本流式输出
-                    if event_type == "on_chat_model_stream":
-                        chunk = event.get("data", {}).get("chunk", "")
-                        if chunk:
-                            if isinstance(chunk, AIMessage):
-                                if chunk.content and isinstance(chunk.content, str):
-                                    if chunk.content.strip():
-                                        if not assistant_output_active:
-                                            self.console.print("\n[magenta]━ Assistant Response ━[/magenta]")
-                                            assistant_output_active = True
-                                        print(chunk.content, end="", flush=True)
-                    
-                    # 处理工具调用开始
-                    elif event_type == "on_tool_start":
-                        if assistant_output_active:
-                            print()
-                            assistant_output_active = False
+                async with self.tracer.async_span(turn_name, category="turn", input=user_input[:80]):
+                    agent_invoke_start_ts = self.tracer.start_span(
+                        "agent.invoke", category="agent",
+                        model=self.model.model_name
+                    )
+                    async for event in self.agent.astream_events(
+                        {"messages": [HumanMessage(content=user_input)]},
+                        config=config,
+                        version="v2"
+                    ):
+                        event_type = event.get("event", "")
                         
-                        tool_name = event.get("name", "unknown")
-                        tool_input = event.get("data", {}).get("input", {})
+                        # agent.invoke span 持续到首次 LLM 流或工具调用
+                        if agent_invoke_start_ts is not None and event_type in (
+                            "on_chat_model_stream", "on_tool_start"
+                        ):
+                            self.tracer.end_span("agent.invoke", agent_invoke_start_ts)
+                            agent_invoke_start_ts = None
                         
-                        print()  # 换行
-                        if tool_input:
-                            import json
-                            args_str = json.dumps(tool_input, indent=2, ensure_ascii=False)
-                            self.console.print(
-                                Panel.fit(
-                                    Markdown(f'**🔧 Tool**: `{tool_name}`\n\n**Parameters**:\n```json\n{args_str}\n```'),
-                                    title="[yellow]⚡ Tool Execution[/yellow]",
-                                    border_style="yellow",
+                        # 处理 AI 文本流式输出
+                        if event_type == "on_chat_model_stream":
+                            # 结束 llm.think（如果存在）
+                            if llm_think_start_ts is not None:
+                                self.tracer.end_span("llm.think", llm_think_start_ts)
+                                llm_think_start_ts = None
+                            if llm_stream_start_ts is None:
+                                llm_stream_start_ts = self.tracer.start_span(
+                                    "llm.stream", category="llm",
+                                    model=self.model.model_name
                                 )
+                            chunk = event.get("data", {}).get("chunk", "")
+                            if chunk:
+                                if isinstance(chunk, AIMessage):
+                                    if chunk.content and isinstance(chunk.content, str):
+                                        if chunk.content.strip():
+                                            if not assistant_output_active:
+                                                self.console.print("\n[magenta]━ Assistant Response ━[/magenta]")
+                                                assistant_output_active = True
+                                            print(chunk.content, end="", flush=True)
+                        
+                        # 处理工具调用开始
+                        elif event_type == "on_tool_start":
+                            # 结束 LLM stream span
+                            if llm_stream_start_ts is not None:
+                                self.tracer.end_span("llm.stream", llm_stream_start_ts)
+                                llm_stream_start_ts = None
+                            # 结束 llm.think（如果存在，连续工具调用场景）
+                            if llm_think_start_ts is not None:
+                                self.tracer.end_span("llm.think", llm_think_start_ts)
+                                llm_think_start_ts = None
+                            if assistant_output_active:
+                                print()
+                                assistant_output_active = False
+                            
+                            tool_name = event.get("name", "unknown")
+                            tool_input = event.get("data", {}).get("input", {})
+                            run_id = event.get("run_id", "")
+                            
+                            # 开始追踪工具调用
+                            tool_spans[run_id] = self.tracer.start_span(
+                                f"tool.{tool_name}", category="tool",
+                                input=str(tool_input)[:100]
                             )
-                        else:
-                            self.console.print(
-                                Panel.fit(
-                                    Markdown(f'**🔧 Tool**: `{tool_name}`'),
-                                    title="[yellow]⚡ Tool Execution[/yellow]",
-                                    border_style="yellow",
+                            
+                            print()  # 换行
+                            if tool_input:
+                                import json
+                                args_str = json.dumps(tool_input, indent=2, ensure_ascii=False)
+                                self.console.print(
+                                    Panel.fit(
+                                        Markdown(f'**🔧 Tool**: `{tool_name}`\n\n**Parameters**:\n```json\n{args_str}\n```'),
+                                        title="[yellow]⚡ Tool Execution[/yellow]",
+                                        border_style="yellow",
+                                    )
                                 )
+                            else:
+                                self.console.print(
+                                    Panel.fit(
+                                        Markdown(f'**🔧 Tool**: `{tool_name}`'),
+                                        title="[yellow]⚡ Tool Execution[/yellow]",
+                                        border_style="yellow",
+                                    )
+                                )
+                            print()  # 工具调用后换行
+                        
+                        # 处理工具执行完成
+                        elif event_type == "on_tool_end":
+                            run_id = event.get("run_id", "")
+                            tool_name = event.get("name", "tool")
+                            # 结束工具 span
+                            if run_id in tool_spans:
+                                self.tracer.end_span(f"tool.{tool_name}", tool_spans.pop(run_id))
+                            
+                            # 开始追踪工具结果→下一次LLM响应的 gap
+                            llm_think_start_ts = self.tracer.start_span(
+                                "llm.think", category="llm"
                             )
-                        print()  # 工具调用后换行
+                            
+                            print()  # 换行
+                            tool_output = event.get("data", {}).get("output", "")
+                            
+                            # 提取实际内容：可能是 str 或 ToolMessage 对象
+                            if hasattr(tool_output, 'content'):
+                                tool_content = str(tool_output.content)
+                            elif isinstance(tool_output, str):
+                                tool_content = tool_output
+                            else:
+                                tool_content = str(tool_output)
+                            
+                            if tool_content:
+                                content_preview = tool_content[:500] if len(tool_content) > 500 else tool_content
+                                self.console.print(
+                                    Panel.fit(
+                                        Syntax("\n" + content_preview + ("\n...[truncated]" if len(tool_content) > 500 else ""), "text"),
+                                        title=f"[green]✅ Tool Result: {tool_name}[/green]",
+                                        border_style="green",
+                                    )
+                                )
+                            print()  # 工具结果后换行
                     
-                    # 处理工具执行完成
-                    elif event_type == "on_tool_end":
-                        print()  # 换行
-                        tool_output = event.get("data", {}).get("output", "")
-                        tool_name = event.get("name", "tool")
-                        
-                        if isinstance(tool_output, str):
-                            content_preview = tool_output[:500] if len(tool_output) > 500 else tool_output
-                            self.console.print(
-                                Panel.fit(
-                                    Syntax("\n" + content_preview + ("\n...[truncated]" if len(tool_output) > 500 else ""), "text"),
-                                    title=f"[green]✅ Tool Result: {tool_name}[/green]",
-                                    border_style="green",
-                                )
-                            )
-                        print()  # 工具结果后换行
+                    # LLM stream 结束
+                    if llm_stream_start_ts is not None:
+                        self.tracer.end_span("llm.stream", llm_stream_start_ts)
+                        llm_stream_start_ts = None
+                    # llm.think 结束
+                    if llm_think_start_ts is not None:
+                        self.tracer.end_span("llm.think", llm_think_start_ts)
+                        llm_think_start_ts = None
                 
                 # 确保最后有换行
                 if assistant_output_active:
@@ -332,8 +415,28 @@ Ask for clarification when needed. Remember to examine test failure messages car
         
         finally:
             # 记录会话结束
+            self.tracer.event("session.end", category="lifecycle")
             self.memory.add_conversation("main", "system", "会话结束")
             self.logger.info("Agent 会话结束")
+            
+            # 保存 trace 文件
+            try:
+                trace_path = self.tracer.save()
+                stats = self.tracer.stats()
+                self.console.print(
+                    Panel.fit(
+                        Markdown(
+                            f"📊 **Trace saved**: `{trace_path}`\n\n"
+                            f"- Total events: {stats['total_events']}\n"
+                            f"- Total duration: {stats['total_duration_ms']:.0f}ms\n"
+                            f"- Open with: **chrome://tracing** or **https://ui.perfetto.dev**"
+                        ),
+                        title="[dim]Trace[/dim]",
+                        border_style="dim",
+                    )
+                )
+            except Exception as e:
+                self.logger.warning(f"保存 trace 失败: {e}")
     
     def _build_memory_context(self) -> str:
         """构建记忆上下文,注入到 system prompt"""
@@ -379,11 +482,12 @@ Ask for clarification when needed. Remember to examine test failure messages car
 
         # Define MCP configurations
         mcp_configs = {
-            "duckduckgo_MCP": {
-                "command": "docker",
-                "args": ["run", "-i", "--rm", "mcp/duckduckgo"],
-                "transport": "stdio",
-            },
+            # DuckDuckGo MCP 已替换为本地 web_search 工具（tools/web_search.py），无需 Docker
+            # "duckduckgo_MCP": {
+            #     "command": "docker",
+            #     "args": ["run", "-i", "--rm", "mcp/duckduckgo"],
+            #     "transport": "stdio",
+            # },
             # Desktop Commander replaced by local tools
             # Python Run MCP commented out (slow initialization)
         }
