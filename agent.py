@@ -424,6 +424,11 @@ Ask for clarification when needed. Remember to examine test failure messages car
                     hw_parts.append(f"RSS {hw_delta['mem_delta_kb']:+d}KB [dim](process-level)[/dim]")
                 if hw_delta['io_read_ops'] or hw_delta['io_write_ops']:
                     hw_parts.append(f"IO {hw_delta['io_read_ops']}r/{hw_delta['io_write_ops']}w")
+                # 网络 I/O
+                net_sent = hw_delta.get('net_sent_bytes', 0)
+                net_recv = hw_delta.get('net_recv_bytes', 0)
+                if net_sent > 0 or net_recv > 0:
+                    hw_parts.append(f"net {net_recv/1024:.1f}KB↓/{net_sent/1024:.1f}KB↑")
                 if hw_delta['ctx_total'] > 0:
                     hw_parts.append(f"ctx {hw_delta['ctx_total']}")
                 if hw_delta['page_faults_maj'] > 0:
@@ -765,7 +770,8 @@ Ask for clarification when needed. Remember to examine test failure messages car
             for tool_name, hw in sorted_tools:
                 err_tag  = f" [red]\u26a0 {hw['errors']}err/{hw['error_rate_pct']:.0f}%[/red]" if hw['errors'] else ""
                 conc_tag = f" [magenta]peak_conc={hw['peak_concurrent']}[/magenta]" if hw['peak_concurrent'] > 1 else ""
-                lines.append(f"  [bold cyan]\U0001f527 {tool_name}[/bold cyan]  calls={hw['calls']}{err_tag}{conc_tag}")
+                sample_tag = f" [yellow]\u26a0 small sample({hw['calls']})[/yellow]" if hw.get('small_sample', False) else ""
+                lines.append(f"  [bold cyan]\U0001f527 {tool_name}[/bold cyan]  calls={hw['calls']}{err_tag}{conc_tag}{sample_tag}")
                 lines.append(
                     f"     Wall  avg={hw['avg_wall_ms']:.0f}ms  "
                     f"min={hw['min_wall_ms']:.0f}  max={hw['max_wall_ms']:.0f}  "
@@ -776,8 +782,12 @@ Ask for clarification when needed. Remember to examine test failure messages car
                     f"min={hw['min_cpu_ms']:.1f}  max={hw['max_cpu_ms']:.1f}  "
                     f"p50={hw['p50_cpu_ms']:.1f}  p95={hw['p95_cpu_ms']:.1f}  "
                     f"cpu%={hw['cpu_pct']:.0f}%  total={hw['total_cpu_ms']:.1f}ms  "
-                    f"[dim](src={hw['cpu_source']})[/dim]"
                 )
+                # CPU来源标注：进程级时用黄色警告
+                if hw['cpu_source'] == 'process':
+                    lines[-1] += f" [yellow]\u26a0 src={hw['cpu_source']} (concurrent-safe)[/yellow]"
+                else:
+                    lines[-1] += f" [dim](src={hw['cpu_source']})[/dim]"
                 mem_line = (
                     f"     Mem   \u0394rss={hw['total_mem_delta_kb']:+d}KB  "
                     f"avg\u0394={hw['avg_mem_delta_kb']:+.1f}KB  "
@@ -793,6 +803,9 @@ Ask for clarification when needed. Remember to examine test failure messages car
                     io_parts.append(f"blk {hw['total_io_read']}r/{hw['total_io_write']}w (avg {hw['avg_io_read']:.0f}r/{hw['avg_io_write']:.0f}w)")
                 if hw['total_page_faults_min'] or hw['total_page_faults_maj']:
                     io_parts.append(f"pgflt {hw['total_page_faults_min']}min/{hw['total_page_faults_maj']}maj")
+                # 网络 I/O
+                if hw.get('total_net_sent_kb', 0) or hw.get('total_net_recv_kb', 0):
+                    io_parts.append(f"net {hw['total_net_recv_kb']:.0f}KB↓/{hw['total_net_sent_kb']:.0f}KB↑")
                 if io_parts:
                     lines.append(f"     IO    {' | '.join(io_parts)}")
                 if hw['total_ctx_switches'] > 0:

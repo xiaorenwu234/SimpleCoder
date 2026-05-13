@@ -9,8 +9,10 @@
 硬件监控维度（每次工具调用均采集差量）:
   执行时间: 墙上时钟 wall_ms
   CPU:      用户态 cpu_user_ms / 系统态 cpu_sys_ms / 合计 cpu_total_ms / 瞬时占比 cpu_pct
+            线程级 thread_cpu_ms (并发安全，首选指标)
   内存:     RSS增量 mem_delta_kb / 当前RSS mem_rss_kb / 虚拟内存 mem_vms_kb / 峰值RSS peak_rss_kb / swap增量 mem_swap_delta_kb
   IO:       块读 io_read_ops / 块写 io_write_ops
+            网络 net_sent_bytes / net_recv_bytes (进程级)
   缺页:     次缺页 page_faults_min / 主缺页 page_faults_maj
   上下文:   自愿切换 ctx_vol / 非自愿 ctx_invol / 合计 ctx_total
   线程:     执行时线程数 thread_count / 线程变化量 thread_delta
@@ -154,6 +156,9 @@ class Tracer:
             'thread_count':    0,
             'open_fds':        0,
             'cpu_pct':         0.0,
+            # 网络 I/O 默认值
+            'net_bytes_sent':  0,
+            'net_bytes_recv':  0,
         }
 
         # --- psutil 采集 ---
@@ -173,6 +178,14 @@ class Tracer:
                     pass
                 try:
                     snap['mem_swap'] = psutil.swap_memory().used
+                except Exception:
+                    pass
+                # 网络 I/O 统计（进程级，包含所有线程）
+                try:
+                    net_counters = psutil.net_io_counters()
+                    if net_counters:
+                        snap['net_bytes_sent'] = net_counters.bytes_sent
+                        snap['net_bytes_recv'] = net_counters.bytes_recv
                 except Exception:
                     pass
             except Exception:
@@ -253,6 +266,9 @@ class Tracer:
             'thread_delta':      after['thread_count'] - before['thread_count'],
             'open_fds':          after['open_fds'],
             'open_fds_delta':    after['open_fds'] - before['open_fds'],
+            # 网络 I/O 差量（字节）
+            'net_sent_bytes':    after['net_bytes_sent'] - before['net_bytes_sent'],
+            'net_recv_bytes':    after['net_bytes_recv'] - before['net_bytes_recv'],
         }
     
     @contextmanager
@@ -425,6 +441,8 @@ class Tracer:
             total_ctx   = sum(d['ctx_total']      for d in deltas)
             total_pfmin = sum(d['page_faults_min'] for d in deltas)
             total_pfmaj = sum(d['page_faults_maj'] for d in deltas)
+            total_net_sent = sum(d.get('net_sent_bytes', 0) for d in deltas)
+            total_net_recv = sum(d.get('net_recv_bytes', 0) for d in deltas)
             errors      = sum(1 for d in deltas if d.get('had_error', False))
 
             # 已排序列表（用于百分位 / min / max）
@@ -443,6 +461,8 @@ class Tracer:
                 'error_rate_pct':     round(errors / n * 100, 1),
                 # CPU 来源标注
                 'cpu_source':         'thread' if thread_available else 'process',
+                # 小样本警告标记
+                'small_sample':       n < 10,
                 # CPU (ms) — 首选线程级，降级时为进程级
                 'total_cpu_ms':       round(total_cpu, 2),
                 'avg_cpu_ms':         round(total_cpu / n, 2),
@@ -452,7 +472,7 @@ class Tracer:
                 'p95_cpu_ms':         self._percentile(cpu_sorted, 95),
                 # 进程级 CPU（并发时可能混入其他线程，仅供参考）
                 'proc_cpu_total_ms':  round(total_proc_cpu, 2),
-                # 墙上时锏 (ms)
+                # 墙上时钟 (ms)
                 'total_wall_ms':      round(total_wall, 2),
                 'avg_wall_ms':        round(total_wall / n, 2),
                 'min_wall_ms':        round(wall_sorted[0], 2),
@@ -482,6 +502,11 @@ class Tracer:
                 # 并发
                 'peak_concurrent':    peak_concurrent,
                 'avg_concurrent':     avg_concurrent,
+                # 网络 I/O (字节)
+                'total_net_sent_kb':  round(total_net_sent / 1024, 1),
+                'total_net_recv_kb':  round(total_net_recv / 1024, 1),
+                'avg_net_sent_kb':    round(total_net_sent / 1024 / n, 1) if n > 0 else 0,
+                'avg_net_recv_kb':    round(total_net_recv / 1024 / n, 1) if n > 0 else 0,
             }
         return report
 
