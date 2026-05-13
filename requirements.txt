@@ -1,17 +1,9 @@
 # SimpleCoder Requirements
 # Python version: >=3.11,<3.13
 
-# LangChain & LangGraph (core framework)
-langgraph>=0.2.53,<0.3.0
-langchain>=0.3.7,<0.4.0
-langchain-openai>=0.3.0,<0.4.0
-langchain-anthropic>=0.3.0,<0.4.0
-langchain-community>=0.3.7,<0.4.0
-langchain-core>=0.3.63,<0.4.0
-langchain-mcp-adapters>=0.1.11,<0.2.0
-langchain-text-splitters>=0.3.8,<0.4.0
-langsmith>=0.1.147
-langgraph-checkpoint-sqlite>=2.0.11,<3.0.0
+# AgentScope (core framework) - 替代 LangChain/LangGraph
+agentscope>=0.1.0
+agentscope-runtime>=0.1.0
 
 # LLM Providers
 openai>=1.100.0
@@ -21,6 +13,7 @@ litellm>=1.80.0
 # MCP (Model Context Protocol)
 mcp>=1.15.0
 fastmcp>=3.0.0
+ddgs
 
 # Async Libraries
 aiohttp>=3.10.0

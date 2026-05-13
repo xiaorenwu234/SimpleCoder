@@ -6,7 +6,7 @@ async def async_main():
     agent = Agent()
     await agent.initialize()
     await agent.run()
-    await agent.close_checkpointer()
+    await agent.close()
 
 
 if __name__ == "__main__":

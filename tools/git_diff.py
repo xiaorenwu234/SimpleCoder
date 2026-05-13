@@ -1,19 +1,17 @@
-from langchain.tools import BaseTool
-from pydantic import BaseModel, Field
-from typing import Optional
-import subprocess
+"""Git差异工具 - AgentScope 格式"""
+import asyncio
 import os
+from typing import Optional
+from agentscope.tool import ToolResponse
+from agentscope.message import TextBlock
 
 
-class GitDiffInput(BaseModel):
-    file_path: Optional[str] = Field(None, description="Specific file to show diff for (optional)")
-    staged: Optional[bool] = Field(False, description="Show staged changes (default: False for unstaged)")
-    stat: Optional[bool] = Field(False, description="Show diffstat summary only")
-
-
-class GitDiffTool(BaseTool):
-    name: str = "git_diff"
-    description: str = """Show git diff for changes in the repository.
+async def git_diff(
+    file_path: Optional[str] = None,
+    staged: bool = False,
+    stat: bool = False
+) -> ToolResponse:
+    """Show git diff for changes in the repository.
     
     Shows:
     - Added lines (green, prefixed with +)
@@ -30,83 +28,102 @@ class GitDiffTool(BaseTool):
         file_path: Specific file (optional)
         staged: Show staged changes (default: False)
         stat: Show diffstat only (default: False)
+    
+    Returns:
+        ToolResponse with git diff
     """
-    args_schema: type = GitDiffInput
-
-    def _run(self, file_path: str = None, staged: bool = False, stat: bool = False) -> str:
-        """Show git diff."""
+    try:
+        # Check if in git repo
+        process = await asyncio.create_subprocess_exec(
+            "git", "rev-parse", "--is-inside-work-tree",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            return ToolResponse(
+                content=[TextBlock(type="text", text="Error: Not in a Git repository")]
+            )
+        
+        # Build command
+        cmd = ["git", "diff"]
+        
+        if staged:
+            cmd.append("--staged")
+        
+        if stat:
+            cmd.append("--stat")
+        
+        if file_path:
+            # Resolve relative paths
+            if not os.path.isabs(file_path):
+                file_path = os.path.join(os.getcwd(), file_path)
+            cmd.append("--")
+            cmd.append(file_path)
+        
+        # Run git diff
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
         try:
-            # Check if in git repo
-            result = subprocess.run(
-                ["git", "rev-parse", "--is-inside-work-tree"],
-                capture_output=True,
-                text=True,
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
                 timeout=10
             )
-            
-            if result.returncode != 0:
-                return "Error: Not in a Git repository"
-            
-            # Build command
-            cmd = ["git", "diff"]
-            
+        except asyncio.TimeoutError:
+            process.kill()
+            return ToolResponse(
+                content=[TextBlock(type="text", text="Error: Git diff timed out")]
+            )
+        
+        if process.returncode != 0:
+            stderr_str = stderr.decode('utf-8', errors='replace')
+            return ToolResponse(
+                content=[TextBlock(type="text", text=f"Error running git diff:\n{stderr_str}")]
+            )
+        
+        stdout_str = stdout.decode('utf-8', errors='replace')
+        
+        output = []
+        
+        if stat:
+            output.append("📊 Diffstat Summary:")
+            output.append("")
+        else:
             if staged:
-                cmd.append("--staged")
-            
-            if stat:
-                cmd.append("--stat")
-            
-            if file_path:
-                # Resolve relative paths
-                if not os.path.isabs(file_path):
-                    file_path = os.path.join(os.getcwd(), file_path)
-                cmd.append("--")
-                cmd.append(file_path)
-            
-            # Run git diff
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=10
+                output.append("📝 Staged Changes:")
+            else:
+                output.append("📝 Unstaged Changes:")
+            output.append("")
+        
+        if not stdout_str.strip():
+            output.append("✅ No changes found!")
+        else:
+            output.append(stdout_str)
+        
+        # Also show untracked files if not showing stat
+        if not stat and not file_path:
+            process = await asyncio.create_subprocess_exec(
+                "git", "ls-files", "--others", "--exclude-standard",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
+            stdout, _ = await process.communicate()
             
-            if result.returncode != 0:
-                return f"Error running git diff:\n{result.stderr}"
+            if stdout.strip():
+                untracked_str = stdout.decode('utf-8', errors='replace')
+                output.append("\n📄 Untracked Files:")
+                output.append(untracked_str)
+        
+        return ToolResponse(
+            content=[TextBlock(type="text", text="\n".join(output))]
+        )
             
-            output = []
-            
-            if stat:
-                output.append("📊 Diffstat Summary:")
-                output.append("")
-            else:
-                if staged:
-                    output.append("📝 Staged Changes:")
-                else:
-                    output.append("📝 Unstaged Changes:")
-                output.append("")
-            
-            if not result.stdout.strip():
-                output.append("✅ No changes found!")
-            else:
-                output.append(result.stdout)
-            
-            # Also show untracked files if not showing stat
-            if not stat and not file_path:
-                untracked = subprocess.run(
-                    ["git", "ls-files", "--others", "--exclude-standard"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                
-                if untracked.stdout.strip():
-                    output.append("\n📄 Untracked Files:")
-                    output.append(untracked.stdout)
-            
-            return "\n".join(output)
-            
-        except subprocess.TimeoutExpired:
-            return f"Error: Git diff timed out"
-        except Exception as e:
-            return f"Error running git diff: {str(e)}"
+    except Exception as e:
+        return ToolResponse(
+            content=[TextBlock(type="text", text=f"Error running git diff: {str(e)}")]
+        )
