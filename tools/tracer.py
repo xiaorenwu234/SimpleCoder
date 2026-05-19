@@ -85,14 +85,21 @@ class Tracer:
             self._events.append(event)
     
     def _hw_snapshot(self) -> Dict[str, Any]:
-        """采集当前进程硬件资源快照（macOS / Linux 兼容）
+        """采集当前线程/进程硬件资源快照（macOS / Linux 兼容）
 
         CPU 采集策略说明：
           - thread_cpu_ns : time.CLOCK_THREAD_CPUTIME_ID — 「本线程」精硬 CPU 时间，
                             并发场景下不受其他工具线程干扰，为首选指标。
-          - cpu_user/sys  : resource.getrusage(RUSAGE_SELF) — 「进程」级累计值，
-                            并发时包含所有工具线程的总消耗，可用于说明进程整体负荷。
+          - cpu_user/sys  : resource.getrusage(RUSAGE_THREAD) — 「本线程」CPU 时间，
+                            并发安全；平台不支持时降级为 RUSAGE_SELF（进程级）。
           - cpu_pct       : psutil.cpu_percent(None) — 非阻塞快照，只反映结束时刻点。
+
+        resource 模块采集策略：
+          - 优先使用 RUSAGE_THREAD（线程级，并发安全）: 
+            缺页、上下文切换、块 IO、CPU user/sys 均精准到本线程。
+          - 降级到 RUSAGE_SELF（进程级）当 RUSAGE_THREAD 不可用时。
+          - max_rss_raw: 始终使用 RUSAGE_SELF，因为 ru_maxrss 在 RUSAGE_THREAD
+            下不可用（Linux）或返回 0（macOS），且峰值 RSS 本身就是进程级概念。
 
         resource 模块字段（POSIX，极简容器可能缺失，统一 getattr 兜底）:
             cpu_user:        用户态 CPU 时间 (秒)
@@ -113,7 +120,18 @@ class Tracer:
             open_fds:   打开的文件描述符数
             cpu_pct:    瞬时 CPU 占用率 (%，非阻塞)
         """
-        usage = resource.getrusage(resource.RUSAGE_SELF)
+        # --- resource 线程级/进程级采集 ---
+        # 优先使用 RUSAGE_THREAD 获取线程级资源统计（并发安全）
+        try:
+            usage = resource.getrusage(resource.RUSAGE_THREAD)
+            self._thread_rusage_available = True
+        except (AttributeError, ValueError):
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            self._thread_rusage_available = False
+
+        # ru_maxrss 在 RUSAGE_THREAD 下不可用（Linux）或返回 0（macOS），
+        # 始终从 RUSAGE_SELF 获取进程级峰值 RSS
+        max_rss_raw = getattr(resource.getrusage(resource.RUSAGE_SELF), 'ru_maxrss', 0)
 
         # --- psutil 首次探测 ---
         if self._psutil_available is None:
@@ -139,15 +157,15 @@ class Tracer:
 
         snap: Dict[str, Any] = {
             'thread_cpu_ns':   thread_cpu_ns,   # 线程级精硬 CPU (纳秒)
-            'cpu_user':        usage.ru_utime,  # 进程级用户态 CPU (秒)
-            'cpu_sys':         usage.ru_stime,  # 进程级系统态 CPU (秒)
+            'cpu_user':        usage.ru_utime,  # 线程级用户态 CPU (秒)
+            'cpu_sys':         usage.ru_stime,  # 线程级系统态 CPU (秒)
             'io_in':           io_in,
             'io_out':          io_out,
             'ctx_vol':         getattr(usage, 'ru_nvcsw',   0),
             'ctx_invol':       getattr(usage, 'ru_nivcsw',  0),
             'page_faults_min': getattr(usage, 'ru_minflt',  0),
             'page_faults_maj': getattr(usage, 'ru_majflt',  0),
-            'max_rss_raw':     getattr(usage, 'ru_maxrss',  0),
+            'max_rss_raw':     max_rss_raw,
             'wall_ts':         time.perf_counter(),
             # psutil 默认值
             'mem_rss':         0,
@@ -159,6 +177,11 @@ class Tracer:
             # 网络 I/O 默认值
             'net_bytes_sent':  0,
             'net_bytes_recv':  0,
+            # 文件 I/O 字节数默认值（psutil io_counters）
+            'io_read_bytes':   0,
+            'io_write_bytes':  0,
+            # 当前打开文件列表默认值
+            'open_files_list': [],
         }
 
         # --- psutil 采集 ---
@@ -188,6 +211,18 @@ class Tracer:
                         snap['net_bytes_recv'] = net_counters.bytes_recv
                 except Exception:
                     pass
+                # 文件 I/O 字节数（累计，含所有线程；Linux 从 /proc/pid/io 读取）
+                try:
+                    io_c = proc.io_counters()
+                    snap['io_read_bytes']  = io_c.read_bytes
+                    snap['io_write_bytes'] = io_c.write_bytes
+                except (AttributeError, psutil.AccessDenied, NotImplementedError, OSError):
+                    pass
+                # 当前打开的文件路径列表（用于差量计算访问了哪些文件）
+                try:
+                    snap['open_files_list'] = [f.path for f in proc.open_files()]
+                except (AttributeError, psutil.AccessDenied, OSError):
+                    pass
             except Exception:
                 pass
 
@@ -199,15 +234,15 @@ class Tracer:
 
         CPU 指标说明:
             thread_cpu_ms  : 「本线程」消耗的精硬 CPU，并发安全。-1 表示平台不支持。
-            cpu_user_ms    : 进程级用户态 CPU 差量（并发时含其他工具线程的贡献）
-            cpu_sys_ms     : 进程级系统态 CPU 差量
+            cpu_user_ms    : 线程级用户态 CPU 差量（RUSAGE_THREAD 时并发安全）
+            cpu_sys_ms     : 线程级系统态 CPU 差量（RUSAGE_THREAD 时并发安全）
             cpu_total_ms   : cpu_user_ms + cpu_sys_ms
             cpu_pct_end    : 结束时刻 psutil 的进程 CPU 占比快照
 
-        其他字段:
+        其他字段（优先 RUSAGE_THREAD 时均线程级，并发安全）:
             wall_ms:            墙上时钟耗时 (ms)
-            io_read_ops:        块读操作次数
-            io_write_ops:       块写操作次数
+            io_read_ops:        块读操作次数（线程级）
+            io_write_ops:       块写操作次数（线程级）
             ctx_vol:            自愿上下文切换次数
             ctx_invol:          非自愿上下文切换次数
             ctx_total:          上下文切换总次数
@@ -237,6 +272,19 @@ class Tracer:
         b_ns = before.get('thread_cpu_ns', -1)
         a_ns = after.get('thread_cpu_ns', -1)
         thread_cpu_ms = (a_ns - b_ns) / 1_000_000 if (b_ns >= 0 and a_ns >= 0) else -1.0
+
+        # 文件 I/O 字节数差量（max(0,...) 防止子进程干扰导致负值）
+        io_read_bytes  = max(0, after.get('io_read_bytes', 0)  - before.get('io_read_bytes', 0))
+        io_write_bytes = max(0, after.get('io_write_bytes', 0) - before.get('io_write_bytes', 0))
+
+        # 新增访问的文件：执行后新打开且仍处于打开状态的非系统文件
+        _SYS_PREFIXES = ('/proc/', '/dev/', '/sys/', '/run/', '/lib', '/usr/lib', '/usr/share')
+        before_files = set(before.get('open_files_list', []))
+        after_files  = set(after.get('open_files_list', []))
+        files_accessed = sorted(
+            f for f in (after_files - before_files)
+            if not any(f.startswith(p) for p in _SYS_PREFIXES)
+        )[:10]
 
         return {
             # 线程级精硬 CPU（首选，并发安全）
@@ -269,6 +317,11 @@ class Tracer:
             # 网络 I/O 差量（字节）
             'net_sent_bytes':    after['net_bytes_sent'] - before['net_bytes_sent'],
             'net_recv_bytes':    after['net_bytes_recv'] - before['net_bytes_recv'],
+            # 文件 I/O 字节数差量
+            'io_read_bytes':     io_read_bytes,
+            'io_write_bytes':    io_write_bytes,
+            # 新增访问的文件（执行期间打开且结束时未关闭的非系统文件）
+            'files_accessed':    files_accessed,
         }
     
     @contextmanager
@@ -443,6 +496,11 @@ class Tracer:
             total_pfmaj = sum(d['page_faults_maj'] for d in deltas)
             total_net_sent = sum(d.get('net_sent_bytes', 0) for d in deltas)
             total_net_recv = sum(d.get('net_recv_bytes', 0) for d in deltas)
+            total_read_bytes  = sum(d.get('io_read_bytes',  0) for d in deltas)
+            total_write_bytes = sum(d.get('io_write_bytes', 0) for d in deltas)
+            all_files_accessed: set = set()
+            for _d in deltas:
+                all_files_accessed.update(_d.get('files_accessed', []))
             errors      = sum(1 for d in deltas if d.get('had_error', False))
 
             # 已排序列表（用于百分位 / min / max）
@@ -507,6 +565,13 @@ class Tracer:
                 'total_net_recv_kb':  round(total_net_recv / 1024, 1),
                 'avg_net_sent_kb':    round(total_net_sent / 1024 / n, 1) if n > 0 else 0,
                 'avg_net_recv_kb':    round(total_net_recv / 1024 / n, 1) if n > 0 else 0,
+                # 文件 I/O 字节数 (KB)
+                'total_io_read_kb':   round(total_read_bytes  / 1024, 1),
+                'total_io_write_kb':  round(total_write_bytes / 1024, 1),
+                'avg_io_read_kb':     round(total_read_bytes  / 1024 / n, 1),
+                'avg_io_write_kb':    round(total_write_bytes / 1024 / n, 1),
+                # 所有调用中访问过的文件（去重聚合）
+                'files_accessed':     sorted(all_files_accessed),
             }
         return report
 

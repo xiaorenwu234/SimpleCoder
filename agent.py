@@ -63,7 +63,9 @@ class Agent:
         api_base = os.getenv("OPENAI_API_BASE") or os.getenv(
             "DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1"
         )
-        model_name = os.getenv("MODEL_NAME", "qwen-plus")
+        api_base="http://localhost:8001/v1"
+        api_key="sk-xxx"
+        model_name = os.getenv("MODEL_NAME", "/home/xueht26/Qwen3-8B")
 
         if not api_key:
             raise RuntimeError(
@@ -93,6 +95,10 @@ class Agent:
             ]
         )
         self.logger = logging.getLogger('Agent')
+        # 屏蔽 httpx / openai 等库的 INFO 日志，避免干扰控制台输出
+        logging.getLogger('httpx').setLevel(logging.WARNING)
+        logging.getLogger('httpcore').setLevel(logging.WARNING)
+        logging.getLogger('openai').setLevel(logging.WARNING)
 
         # Agent 将在 initialize() 中创建
         self.agent = None
@@ -175,27 +181,18 @@ Ask for clarification when needed. Remember to examine test failure messages car
         api_base = os.getenv("OPENAI_API_BASE") or os.getenv("DASHSCOPE_API_BASE", "")
         is_dashscope = "dashscope" in api_base.lower() if api_base else True
         
-        # 创建模型
-        if is_dashscope:
-            self.model = DashScopeChatModel(
-                model_name=os.getenv("MODEL_NAME", "qwen-plus"),
-                api_key=os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY"),
-                # 启用并行工具调用
+        self.model = OpenAIChatModel(
+                model_name="/home/xueht26/Qwen3-8B",
+                api_key="sk-xxx",
+                client_kwargs={
+                    "base_url": "http://localhost:8001/v1",
+                },
                 generate_kwargs={
                     "parallel_tool_calls": True,
                 },
             )
-            formatter = DashScopeChatFormatter()
-        else:
-            self.model = OpenAIChatModel(
-                model_name=os.getenv("MODEL_NAME", "gpt-4"),
-                api_key=os.getenv("OPENAI_API_KEY"),
-                base_url=os.getenv("OPENAI_API_BASE"),
-                generate_kwargs={
-                    "parallel_tool_calls": True,
-                },
-            )
-            formatter = OpenAIChatFormatter()
+        formatter = OpenAIChatFormatter()
+            
 
         # 创建 ReActAgent，启用并行工具调用
         self.agent = ReActAgent(
@@ -211,45 +208,148 @@ Ask for clarification when needed. Remember to examine test failure messages car
         # 完全接管 agent 的 print 方法，实现自定义流式输出
         # 禁用默认控制台输出，避免重复
         self.agent.set_console_output_enabled(False)
-        self._stream_state = {}  # 流式文本输出状态追踪
+        self._stream_state = {}  # 流式文本/thinking输出状态追踪
         
-        # 闭包引用
+        # 闭包引用（_stream_state 捕获 dict 对象，self 捕获实例引用）
         _stream_state = self._stream_state
         
         async def _custom_print(msg, last=True, speech=None):
-            """自定义 print：流式输出文本，跳过工具块（由 middleware 处理）"""
+            """
+            自定义 print。支持两种 thinking 来源：
+              1. 标准 ThinkingBlock（reasoning_content 字段 → AgentScope 解析）
+              2. <think>...</think> 标签嵌入 text（Qwen3/vLLM 风格）
+            thinking 内容显示为可折叠面板，text 内容流式输出。
+            """
             msg_id = msg.id
+            
+            # 初始化消息状态
+            if msg_id not in _stream_state:
+                _stream_state[msg_id] = {
+                    'thinking': '',           # 思考内容
+                    'thinking_start_us': None,
+                    'output_start_us': None,
+                    'thinking_panel_shown': False,
+                    'output_offset': None,    # None=未确定, int=raw text 中 output 的起始位置
+                    'text_len': 0,            # 已输出的 output 字符数
+                }
+            state = _stream_state[msg_id]
+            
+            current_thinking = ''  # 来自标准 ThinkingBlock
+            current_text = ''      # 来自 TextBlock（可能含 <think> 标签）
             
             for block in msg.get_content_blocks():
                 block_type = block.get("type", "")
-                
-                if block_type == "text":
-                    text = block.get("text", "")
-                    
-                    # 追踪已输出的文本长度
-                    if msg_id not in _stream_state:
-                        _stream_state[msg_id] = 0
-                    
-                    prev_len = _stream_state[msg_id]
-                    # 只输出新增部分
-                    if len(text) > prev_len:
-                        new_text = text[prev_len:]
-                        sys.stdout.write(new_text)
-                        sys.stdout.flush()
-                        _stream_state[msg_id] = len(text)
-                
-                elif block_type == "thinking":
-                    pass  # 跳过思考块
-                
-                elif block_type in ("tool_use", "tool_result"):
-                    pass  # 跳过工具块，由 middleware 面板显示
+                if block_type == "thinking":
+                    current_thinking = block.get("thinking", "")
+                elif block_type == "text":
+                    current_text = block.get("text", "")
+                # tool_use / tool_result 由 middleware 面板处理，跳过
             
-            # 最后一条消息时清理状态并补换行
+            # === Case 1: 标准 ThinkingBlock（来自 reasoning_content 字段）===
+            if current_thinking:
+                if state['thinking_start_us'] is None:
+                    state['thinking_start_us'] = self.tracer._now_us()
+                state['thinking'] = current_thinking
+            
+            # === Case 2: <think> 标签嵌入在 text 中（Qwen3/vLLM 风格）===
+            output_text = current_text  # 默认全部为 output
+            
+            if current_text and not current_thinking:
+                if state['output_offset'] is None:
+                    # 尚未确定 output 起始位置
+                    think_start = current_text.find('<think>')
+                    think_end = current_text.find('</think>')
+                    
+                    if think_start < 0:
+                        # 无 think 标签，全部是 output
+                        state['output_offset'] = 0
+                        output_text = current_text
+                    elif think_end > think_start:
+                        # 找到完整的 <think>...</think>
+                        raw_thinking = current_text[think_start + 7:think_end].strip()
+                        state['thinking'] = raw_thinking
+                        if state['thinking_start_us'] is None and raw_thinking:
+                            state['thinking_start_us'] = self.tracer._now_us()
+                        if state['output_start_us'] is None:
+                            state['output_start_us'] = self.tracer._now_us()
+                        # output 从 </think> 之后开始，跳过前导换行
+                        after_close = current_text[think_end + 8:]  # 8 = len('</think>')
+                        stripped = len(after_close) - len(after_close.lstrip('\n'))
+                        state['output_offset'] = think_end + 8 + stripped
+                        output_text = current_text[state['output_offset']:]
+                    else:
+                        # 有 <think> 但还没有 </think>（思考进行中）
+                        raw_partial = current_text[think_start + 7:].strip()
+                        if raw_partial:
+                            state['thinking'] = raw_partial
+                        if state['thinking_start_us'] is None and raw_partial:
+                            state['thinking_start_us'] = self.tracer._now_us()
+                        output_text = ''  # 思考未结束，暂不输出
+                else:
+                    # 已知 output 起始位置，直接切片
+                    output_text = current_text[state['output_offset']:]
+            
+            # === 记录 output 开始时间戳 ===
+            if output_text and state['output_start_us'] is None:
+                state['output_start_us'] = self.tracer._now_us()
+            
+            # === 展示 thinking 面板（thinking 完成时，即将开始 output）===
+            should_show_thinking = (
+                state['thinking']
+                and not state['thinking_panel_shown']
+                and (output_text or last)
+            )
+            if should_show_thinking:
+                state['thinking_panel_shown'] = True
+                thinking_text = state['thinking']
+                thinking_chars = len(thinking_text)
+                thinking_end_us = state['output_start_us'] or self.tracer._now_us()
+                thinking_time_s = (
+                    (thinking_end_us - state['thinking_start_us']) / 1_000_000
+                    if state['thinking_start_us'] else 0
+                )
+                MAX_SHOW = 600
+                if thinking_chars > MAX_SHOW:
+                    display = (
+                        f"[dim]{thinking_text[:MAX_SHOW]}[/dim]\n"
+                        f"[dim]... ({thinking_chars - MAX_SHOW:,} more chars)[/dim]"
+                    )
+                else:
+                    display = f"[dim]{thinking_text}[/dim]"
+                
+                sys.stdout.flush()  # 先刷 stdout，再用 Rich Console 打印
+                self.console.print(
+                    Panel(
+                        display,
+                        title=(
+                            f"[dim]💭 Thinking"
+                            f"  ⏱ {thinking_time_s:.1f}s"
+                            f"  📝 {thinking_chars:,} chars[/dim]"
+                        ),
+                        border_style="dim",
+                        padding=(0, 1),
+                    )
+                )
+            
+            # === 流式输出 output 文本（仅新增部分）===
+            if output_text:
+                prev_len = state['text_len']
+                if len(output_text) > prev_len:
+                    sys.stdout.write(output_text[prev_len:])
+                    sys.stdout.flush()
+                    state['text_len'] = len(output_text)
+            
+            # === 最后一条消息：清理状态，记录时间戳，补换行 ===
             if last:
                 if msg_id in _stream_state:
-                    printed_text_len = _stream_state.pop(msg_id)
-                    # 如果文本不为空且不以换行结尾，补换行
-                    if printed_text_len > 0:
+                    s = _stream_state.pop(msg_id)
+                    # 将 thinking/output 时间戳写入 turn_timeline 供 trace 使用
+                    if s.get('thinking_start_us'):
+                        self._turn_timeline['thinking_start_us'] = s['thinking_start_us']
+                        self._turn_timeline['thinking_end_us'] = (
+                            s.get('output_start_us') or self.tracer._now_us()
+                        )
+                    if s['text_len'] > 0 or s['thinking']:
                         sys.stdout.write("\n")
                         sys.stdout.flush()
         
@@ -289,8 +389,10 @@ Ask for clarification when needed. Remember to examine test failure messages car
         self._turn_timeline = {
             'turn_start': None,
             'last_event_end': None,
-            'llm_spans': [],  # 记录LLM推理阶段
+            'llm_spans': [],   # 记录LLM推理阶段
             'tool_spans': [],  # 记录工具调用阶段
+            'thinking_start_us': None,  # LLM思考阶段开始时间戳
+            'thinking_end_us': None,    # LLM思考阶段结束（=输出阶段开始）时间戳
         }
 
         async def tool_display_middleware(kwargs, next_handler):
@@ -330,21 +432,47 @@ Ask for clarification when needed. Remember to examine test failure messages car
             
             # 检查是否需要记录LLM推理阶段（工具调用前的间隙）
             if self._turn_timeline['last_event_end'] is not None:
-                # 计算从上一个事件结束到现在的间隙（即LLM推理时间）
                 gap_start = self._turn_timeline['last_event_end']
-                gap_end_us = span_ts  # 使用工具开始时间，而不是当前时间
+                gap_end_us = span_ts
                 gap_duration_us = gap_end_us - gap_start
                 
-                # 如果间隙超过50ms，认为是LLM推理阶段
-                if gap_duration_us > 50_000:  # 50ms = 50,000μs
-                    # 使用虚拟tid=3表示LLM推理线程
-                    tracer._add_event(
-                        "llm.reasoning", "X", gap_start,
-                        tid=3,  # LLM推理使用独立的tid
-                        cat="llm",
-                        dur=gap_duration_us,
-                        args={"inferred": True, "gap_before_tool": tool_name}
-                    )
+                if gap_duration_us > 50_000:  # 50ms
+                    t_start = self._turn_timeline.get('thinking_start_us')
+                    t_end   = self._turn_timeline.get('thinking_end_us')
+                    
+                    if t_start and t_end and t_start >= gap_start:
+                        # 有 thinking 阶段：拆分为 pre_thinking + thinking + output
+                        pre_gap = t_start - gap_start
+                        if pre_gap > 50_000:
+                            tracer._add_event(
+                                "llm.pre_thinking", "X", gap_start,
+                                tid=3, cat="llm", dur=pre_gap,
+                                args={"inferred": True, "gap_before_tool": tool_name, "phase": "pre_thinking"}
+                            )
+                        think_dur = t_end - t_start
+                        if think_dur > 0:
+                            tracer._add_event(
+                                "llm.thinking", "X", t_start,
+                                tid=3, cat="llm", dur=think_dur,
+                                args={"inferred": True, "gap_before_tool": tool_name, "phase": "thinking"}
+                            )
+                        output_dur = gap_end_us - t_end
+                        if output_dur > 50_000:
+                            tracer._add_event(
+                                "llm.output", "X", t_end,
+                                tid=3, cat="llm", dur=output_dur,
+                                args={"inferred": True, "gap_before_tool": tool_name, "phase": "output"}
+                            )
+                        # 记录后重置，避免影响后续轮次
+                        self._turn_timeline['thinking_start_us'] = None
+                        self._turn_timeline['thinking_end_us'] = None
+                    else:
+                        # 无 thinking 信息，整个计为 reasoning
+                        tracer._add_event(
+                            "llm.reasoning", "X", gap_start,
+                            tid=3, cat="llm", dur=gap_duration_us,
+                            args={"inferred": True, "gap_before_tool": tool_name}
+                        )
                     self._turn_timeline['llm_spans'].append({
                         'start': gap_start,
                         'duration_us': gap_duration_us
@@ -423,7 +551,18 @@ Ask for clarification when needed. Remember to examine test failure messages car
                 if hw_delta['mem_delta_kb'] != 0:
                     hw_parts.append(f"RSS {hw_delta['mem_delta_kb']:+d}KB [dim](process-level)[/dim]")
                 if hw_delta['io_read_ops'] or hw_delta['io_write_ops']:
-                    hw_parts.append(f"IO {hw_delta['io_read_ops']}r/{hw_delta['io_write_ops']}w")
+                    hw_parts.append(f"blk {hw_delta['io_read_ops']}r/{hw_delta['io_write_ops']}w")
+                # 文件 I/O 字节数
+                io_r_kb = hw_delta.get('io_read_bytes', 0) / 1024
+                io_w_kb = hw_delta.get('io_write_bytes', 0) / 1024
+                if io_r_kb > 0 or io_w_kb > 0:
+                    hw_parts.append(f"file {io_r_kb:.1f}KB↓/{io_w_kb:.1f}KB↑")
+                # 访问的文件
+                fa = hw_delta.get('files_accessed', [])
+                if fa:
+                    names = [os.path.basename(f) for f in fa[:3]]
+                    suffix = f" (+{len(fa)-3}more)" if len(fa) > 3 else ""
+                    hw_parts.append(f"files[{', '.join(names)}{suffix}]")
                 # 网络 I/O
                 net_sent = hw_delta.get('net_sent_bytes', 0)
                 net_recv = hw_delta.get('net_recv_bytes', 0)
@@ -510,11 +649,13 @@ Ask for clarification when needed. Remember to examine test failure messages car
                 self.console.print("")
                 self.console.print(Rule("[bold magenta]🤖 Assistant[/bold magenta]", style="magenta"))
                 
-                # 重置turn时间线
+                # 重置 turn 时间线
                 self._turn_timeline['turn_start'] = self.tracer._now_us()
                 self._turn_timeline['last_event_end'] = self._turn_timeline['turn_start']
                 self._turn_timeline['llm_spans'] = []
                 self._turn_timeline['tool_spans'] = []
+                self._turn_timeline['thinking_start_us'] = None  # 每轮重置
+                self._turn_timeline['thinking_end_us'] = None    # 每轮重置
                 
                 async with self.tracer.async_span(turn_name, category="turn", input=user_input[:80]):
                     # 刷新记忆上下文到 system prompt（确保运行期间新增的记忆也能用上）
@@ -530,19 +671,45 @@ Ask for clarification when needed. Remember to examine test failure messages car
                     # 调用 AgentScope agent
                     response = await self.agent(user_msg)
                     
-                    # turn结束，检查是否有最后的LLM推理阶段
+                    # turn结束：将最终 LLM 推理阶段拆分为 thinking + output 两段
                     turn_end_us = self.tracer._now_us()
                     if self._turn_timeline['last_event_end'] is not None:
                         final_gap = turn_end_us - self._turn_timeline['last_event_end']
                         if final_gap > 50_000:  # 50ms
-                            # 使用虚拟tid=3表示LLM推理线程
-                            self.tracer._add_event(
-                                "llm.reasoning", "X", self._turn_timeline['last_event_end'],
-                                tid=3,  # LLM推理使用独立的tid
-                                cat="llm",
-                                dur=final_gap,
-                                args={"inferred": True, "phase": "final_response"}
-                            )
+                            llm_start = self._turn_timeline['last_event_end']
+                            thinking_start = self._turn_timeline.get('thinking_start_us')
+                            thinking_end   = self._turn_timeline.get('thinking_end_us')
+
+                            if thinking_start and thinking_end and thinking_start >= llm_start:
+                                # 有 thinking 阶段：分三段记录
+                                pre_gap = thinking_start - llm_start
+                                if pre_gap > 50_000:
+                                    self.tracer._add_event(
+                                        "llm.pre_thinking", "X", llm_start,
+                                        tid=3, cat="llm", dur=pre_gap,
+                                        args={"inferred": True, "phase": "pre_thinking"}
+                                    )
+                                think_dur = thinking_end - thinking_start
+                                if think_dur > 0:
+                                    self.tracer._add_event(
+                                        "llm.thinking", "X", thinking_start,
+                                        tid=3, cat="llm", dur=think_dur,
+                                        args={"inferred": True, "phase": "thinking"}
+                                    )
+                                output_dur = turn_end_us - thinking_end
+                                if output_dur > 50_000:
+                                    self.tracer._add_event(
+                                        "llm.output", "X", thinking_end,
+                                        tid=3, cat="llm", dur=output_dur,
+                                        args={"inferred": True, "phase": "output"}
+                                    )
+                            else:
+                                # 无 thinking 阶段：整个计为 reasoning
+                                self.tracer._add_event(
+                                    "llm.reasoning", "X", llm_start,
+                                    tid=3, cat="llm", dur=final_gap,
+                                    args={"inferred": True, "phase": "final_response"}
+                                )
                     
                     # 保存助手回复到记忆系统
                     if response and response.content:
@@ -806,8 +973,18 @@ Ask for clarification when needed. Remember to examine test failure messages car
                 # 网络 I/O
                 if hw.get('total_net_sent_kb', 0) or hw.get('total_net_recv_kb', 0):
                     io_parts.append(f"net {hw['total_net_recv_kb']:.0f}KB↓/{hw['total_net_sent_kb']:.0f}KB↑")
+                # 文件 I/O 字节数
+                if hw.get('total_io_read_kb', 0) or hw.get('total_io_write_kb', 0):
+                    io_parts.append(f"file {hw['total_io_read_kb']:.1f}KB↓/{hw['total_io_write_kb']:.1f}KB↑ (avg {hw['avg_io_read_kb']:.1f}/{hw['avg_io_write_kb']:.1f})")
                 if io_parts:
                     lines.append(f"     IO    {' | '.join(io_parts)}")
+                # 访问的文件列表
+                accessed = hw.get('files_accessed', [])
+                if accessed:
+                    file_names = [os.path.basename(f) for f in accessed[:5]]
+                    if len(accessed) > 5:
+                        file_names.append(f"+{len(accessed)-5} more")
+                    lines.append(f"     Files {', '.join(file_names)}")
                 if hw['total_ctx_switches'] > 0:
                     lines.append(f"     Ctx   total={hw['total_ctx_switches']}  avg={hw['avg_ctx_switches']:.1f}")
                 lines.append("")
