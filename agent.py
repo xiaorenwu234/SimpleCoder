@@ -228,13 +228,13 @@ Ask for clarification when needed. Remember to examine test failure messages car
             
             # 初始化消息状态
             if msg_id not in _stream_state:
-                # 在消息到来时立即记录输出起始时间（用于后续 TPOT 计算）
-                output_start_time = self.tracer._now_us()
+                # 首段以上一次推理结束点为起点；第一次流式返回对齐到 llm.reasoning 开始点
+                reasoning_start_us = self._turn_timeline.get('last_event_end') or self.tracer._now_us()
                 _stream_state[msg_id] = {
                     'thinking': '',           # 思考内容
                     'thinking_start_us': None,
-                    'output_start_us': output_start_time,  # 消息块到达时立即记录
-                    'last_tpot_ts_us': output_start_time,  # 上一次 TPOT 采样时间戳
+                    'output_start_us': reasoning_start_us,
+                    'last_tpot_ts_us': reasoning_start_us,  # 上一次流式推理结束时间戳
                     'thinking_panel_shown': False,
                     'output_offset': None,    # None=未确定, int=raw text 中 output 的起始位置
                     'text_len': 0,            # 已输出的 output 字符数
@@ -341,21 +341,28 @@ Ask for clarification when needed. Remember to examine test failure messages car
                     sys.stdout.flush()
                     state['text_len'] = len(output_text)
                     
-                    # 每次有新增输出时记录一次 TPOT 采样点（用于 timeline 折线）
-                    now_us = self.tracer._now_us()
-                    delta_us = now_us - state.get('last_tpot_ts_us', now_us)
+                    period_end_us = self.tracer._now_us()
+                    period_start_us = state.get('last_tpot_ts_us', period_end_us)
+                    delta_us = period_end_us - period_start_us
                     delta_tokens = self._count_output_tokens(delta_text)
+                    if delta_tokens > 0:
+                        self._turn_timeline['output_tokens_stream'] = (
+                            self._turn_timeline.get('output_tokens_stream', 0) + delta_tokens
+                        )
                     if delta_us > 0 and delta_tokens > 0:
+                        # 每次有新增输出时记录一次 TPOT 采样点（用于 timeline 折线）
                         tpot_ms = (delta_us / 1000.0) / delta_tokens
+
                         self.tracer._add_event(
                             name="llm.output.tpot",
                             ph="C",
-                            ts=now_us,
+                            ts=period_start_us,
                             tid=3,
                             cat="llm",
                             args={"tpot_ms": round(tpot_ms, 4)},
                         )
-                        state['last_tpot_ts_us'] = now_us
+                    # 推进“上一次流式推理结束点”到本次结束
+                    state['last_tpot_ts_us'] = period_end_us
             
             # === 最后一条消息：清理状态，记录时间戳，补换行 ===
             if last:
@@ -371,16 +378,6 @@ Ask for clarification when needed. Remember to examine test failure messages car
                     if s.get('output_start_us'):
                         self._turn_timeline['output_start_us'] = s['output_start_us']
 
-                    # 每轮结束时补一个 TPOT=0 的收尾点，便于 timeline 标记轮次结束
-                    self.tracer._add_event(
-                        name="llm.output.tpot",
-                        ph="C",
-                        ts=self.tracer._now_us(),
-                        tid=3,
-                        cat="llm",
-                        args={"tpot_ms": 0.0},
-                    )
-                    
                     if s['text_len'] > 0 or s['thinking']:
                         sys.stdout.write("\n")
                         sys.stdout.flush()
@@ -426,6 +423,7 @@ Ask for clarification when needed. Remember to examine test failure messages car
             'thinking_start_us': None,  # LLM思考阶段开始时间戳
             'thinking_end_us': None,    # LLM思考阶段结束（=输出阶段开始）时间戳
             'output_start_us': None,    # LLM输出阶段开始时间戳
+            'output_tokens_stream': 0,  # 流式阶段累计输出 token 数
         }
 
         async def tool_display_middleware(kwargs, next_handler):
@@ -718,6 +716,7 @@ Ask for clarification when needed. Remember to examine test failure messages car
                 self._turn_timeline['thinking_start_us'] = None  # 每轮重置
                 self._turn_timeline['thinking_end_us'] = None    # 每轮重置
                 self._turn_timeline['output_start_us'] = None    # 每轮重置
+                self._turn_timeline['output_tokens_stream'] = 0  # 每轮重置
                 
                 async with self.tracer.async_span(turn_name, category="turn", input=user_input[:80]):
                     # 刷新记忆上下文到 system prompt（确保运行期间新增的记忆也能用上）
@@ -774,12 +773,25 @@ Ask for clarification when needed. Remember to examine test failure messages car
                                 )
                     
                     # 保存助手回复到记忆系统
-                    if response and response.content:
+                    resp_text = ""
+                    if response and getattr(response, 'content', None):
                         resp_text = self._extract_response_text(response)
-                        # 记录 LLM TPOT（Time Per Output Token）
-                        self._record_llm_tpot(resp_text, turn_end_us)
                         if resp_text:
                             self.memory.add_conversation(self.session_id, "assistant", resp_text[:500])
+
+                    # 记录 LLM TPOT（Time Per Output Token）
+                    # 工具调用场景下 response.content 可能没有 text block，回退到流式累计 token。
+                    self._record_llm_tpot(resp_text, turn_end_us)
+
+                    # 在 inference 结束时刻补一个 TPOT=0 的收尾 marker
+                    self.tracer._add_event(
+                        name="llm.output.tpot",
+                        ph="C",
+                        ts=turn_end_us,
+                        tid=4,
+                        cat="llm",
+                        args={"tpot_ms": 0.0},
+                    )
                     
                     self.console.print("")
                     self.console.print(Rule(style="dim"))
@@ -833,6 +845,8 @@ Ask for clarification when needed. Remember to examine test failure messages car
                 return
 
             output_tokens = self._count_output_tokens(response_text)
+            if output_tokens <= 0:
+                output_tokens = int(self._turn_timeline.get('output_tokens_stream', 0) or 0)
             if output_tokens <= 0:
                 return
 
@@ -1067,8 +1081,9 @@ Ask for clarification when needed. Remember to examine test failure messages car
             if not report:
                 return "\n".join(lines)
 
+            peak_concurrent_tools = max((hw.get('peak_concurrent', 1) for hw in report.values()), default=1)
             lines.append("  [bold cyan]🔧 Tool Hardware Metrics[/bold cyan]")
-            lines.append(f"  Peak concurrent tools: {conc['peak_concurrent']}")
+            lines.append(f"  Peak concurrent tools: {peak_concurrent_tools}")
             lines.append("")
 
             # 按墙上时锏合计降序排列
