@@ -394,7 +394,7 @@ Ask for clarification when needed. Remember to examine test failure messages car
                     last_ts = state.get('last_tpot_ts_us') or self._turn_timeline.get('output_start_us') or now_us
                     delta_us = now_us - last_ts
                     period_end_us = self.tracer._now_us()
-                    period_start_us = state.get('last_tpot_ts_us', period_end_us)
+                    period_start_us = state.get('last_tpot_ts_us') or period_end_us
                     delta_us = period_end_us - period_start_us
                     delta_tokens = self._count_output_tokens(delta_text)
                     if delta_tokens > 0:

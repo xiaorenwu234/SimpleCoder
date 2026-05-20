@@ -273,7 +273,11 @@ int kret_sock_recvmsg(struct pt_regs *ctx) {
             self._available = True
             # ---- 可选：文件路径追踪（kprobe on openat，不影响 IO 字节采集）----
             try:
-                self._bpf[b'file_events'].open_perf_buffer(self._file_event_callback)
+                self._bpf[b'file_events'].open_perf_buffer(
+                    self._file_event_callback,
+                    page_cnt=64,           # 256KB/CPU，降低 ring buffer 溢出概率
+                    lost_cb=lambda *_: None,  # 静默丢弃，避免 BCC 默认打印 "Possibly lost N samples"
+                )
                 _file_probe_ok = False
                 for _kfn, _bfn in [
                     (b'do_sys_openat2', b'kprobe_openat2'),
@@ -416,7 +420,7 @@ int kret_sock_recvmsg(struct pt_regs *ctx) {
         while not self._poll_stop.is_set():
             try:
                 if self._bpf is not None:
-                    self._bpf.perf_buffer_poll(timeout=100)
+                    self._bpf.perf_buffer_poll(timeout=20)  # 20ms，加快 drain 速度减少溢出
             except Exception:
                 break
 
