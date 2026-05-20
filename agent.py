@@ -350,7 +350,7 @@ Ask for clarification when needed. Remember to examine test failure messages car
                     )
                 else:
                     display = f"[dim]{thinking_text}[/dim]"
-                
+
                 sys.stdout.flush()  # 先刷 stdout，再用 Rich Console 打印
                 self.console.print(
                     Panel(
@@ -399,7 +399,7 @@ Ask for clarification when needed. Remember to examine test failure messages car
                     delta_tokens = self._count_output_tokens(delta_text)
                     if delta_tokens > 0:
                         self._turn_timeline['output_tokens_stream'] = (
-                            self._turn_timeline.get('output_tokens_stream', 0) + delta_tokens
+                        self._turn_timeline.get('output_tokens_stream', 0) + delta_tokens
                         )
                     if delta_us > 0 and delta_tokens > 0:
                         # 每次有新增输出时记录一次 TPOT 采样点（用于 timeline 折线）
