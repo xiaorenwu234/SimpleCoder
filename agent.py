@@ -181,11 +181,23 @@ Ask for clarification when needed. Remember to examine test failure messages car
         api_base = os.getenv("OPENAI_API_BASE") or os.getenv("DASHSCOPE_API_BASE", "")
         is_dashscope = "dashscope" in api_base.lower() if api_base else True
         
+        # self.model = OpenAIChatModel(
+        #         model_name="/home/xueht26/Qwen3-8B",
+        #         api_key="sk-xxx",
+        #         client_kwargs={
+        #             "base_url": "http://localhost:8001/v1",
+        #         },
+        #         generate_kwargs={
+        #             "parallel_tool_calls": True,
+        #         },
+        #     )
+        # formatter = OpenAIChatFormatter()
+        
         self.model = OpenAIChatModel(
-                model_name="/home/xueht26/Qwen3-8B",
-                api_key="sk-xxx",
+                model_name="qwen3.5-flash",
+                api_key="sk-042148052b534517b8bdd2ab37059848",
                 client_kwargs={
-                    "base_url": "http://localhost:8001/v1",
+                    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
                 },
                 generate_kwargs={
                     "parallel_tool_calls": True,
@@ -497,7 +509,16 @@ Ask for clarification when needed. Remember to examine test failure messages car
                 # 采集后快照 + 计算差量
                 hw_after = tracer._hw_snapshot()
                 hw_delta = tracer._hw_delta(hw_before, hw_after)
-                tracer.track_tool_end(tool_name)
+                concurrent_remaining = tracer.track_tool_end(tool_name)
+
+                # 并发污染检测：
+                #   concurrent_count > 1  → 本工具启动时就有其他工具在运行（其 IO 已混入 before 快照后的累计）
+                #   concurrent_remaining > 0 → 本工具结束时尚有其他工具在运行，
+                #                            说明它们在本工具窗口内启动过（其 IO 包含在 after 快照中）
+                is_ebpf_contaminated = concurrent_count > 1 or concurrent_remaining > 0
+                if is_ebpf_contaminated:
+                    hw_delta['ebpf_contaminated'] = True
+                    hw_delta['concurrent_peak'] = max(concurrent_count, concurrent_remaining + 1)
                 
                 # 记录工具调用事件到trace文件（X事件，含完整硬件指标）
                 dur_us = int(elapsed * 1_000_000)
@@ -538,42 +559,57 @@ Ask for clarification when needed. Remember to examine test failure messages car
                 else:
                     display_text += f"\n\n[dim]({len(result_text)} chars, elapsed {elapsed:.2f}s)[/dim]"
 
-                # 硬件摘要行（优先使用线程级CPU，并发安全）
+                # 硬件摘要行（线程级CPU，并发安全）
                 hw_parts = []
-                # 优先显示线程级CPU（并发安全），不可用时降级为进程级
-                if hw_delta.get('thread_cpu_ms', -1) >= 0:
-                    cpu_display = hw_delta['thread_cpu_ms']
-                    cpu_label = 'thread'
+                # 线程级 CPU（CLOCK_THREAD_CPUTIME_ID 总量 + /proc/stat 分时）
+                thread_cpu  = hw_delta.get('thread_cpu_ms', -1)
+                cpu_user    = hw_delta.get('cpu_user_ms', -1)
+                cpu_sys     = hw_delta.get('cpu_sys_ms', -1)
+                cpu_src     = hw_delta.get('cpu_split_source', '')
+                if thread_cpu >= 0:
+                    if cpu_src == 'sub_tick':
+                        # 工具运行时间 < SC_CLK_TCK（通常 10ms），无法区分 user/sys
+                        cpu_detail = f"[dim]{hw_delta['cpu_pct_end']:.0f}% (user/sys <10ms源)[/dim]"
+                    elif cpu_user >= 0 and cpu_sys >= 0:
+                        cpu_detail = f"[dim]user={cpu_user:.2f} sys={cpu_sys:.2f}ms[/dim]"
+                    else:
+                        cpu_detail = f"[dim]{hw_delta['cpu_pct_end']:.0f}%[/dim]"
+                    hw_parts.append(f"CPU[thread] {thread_cpu:.1f}ms ({cpu_detail})")
                 else:
-                    cpu_display = hw_delta['cpu_total_ms']
-                    cpu_label = 'process'
-                hw_parts.append(f"CPU[{cpu_label}] {cpu_display:.1f}ms ({hw_delta['cpu_pct_end']:.0f}%)")
-                if hw_delta['mem_delta_kb'] != 0:
-                    hw_parts.append(f"RSS {hw_delta['mem_delta_kb']:+d}KB [dim](process-level)[/dim]")
+                    hw_parts.append(f"CPU[thread] N/A ({hw_delta['cpu_pct_end']:.0f}%)")
                 if hw_delta['io_read_ops'] or hw_delta['io_write_ops']:
                     hw_parts.append(f"blk {hw_delta['io_read_ops']}r/{hw_delta['io_write_ops']}w")
-                # 文件 I/O 字节数
-                io_r_kb = hw_delta.get('io_read_bytes', 0) / 1024
-                io_w_kb = hw_delta.get('io_write_bytes', 0) / 1024
-                if io_r_kb > 0 or io_w_kb > 0:
-                    hw_parts.append(f"file {io_r_kb:.1f}KB↓/{io_w_kb:.1f}KB↑")
+                # 文件 I/O 字节数（eBPF 线程级；-1 表示不可用）
+                io_r_bytes = hw_delta.get('io_read_bytes', -1)
+                io_w_bytes = hw_delta.get('io_write_bytes', -1)
+                io_bytes_src = hw_delta.get('io_bytes_source', 'unavailable')
+                if io_r_bytes >= 0 or io_w_bytes >= 0:
+                    io_r_kb = max(0, io_r_bytes) / 1024
+                    io_w_kb = max(0, io_w_bytes) / 1024
+                    src_tag = "[dim](ebpf)[/dim]" if io_bytes_src == 'thread_ebpf' else "[dim](unavail)[/dim]"
+                    hw_parts.append(f"file {io_r_kb:.1f}KB↓/{io_w_kb:.1f}KB↑ {src_tag}")
                 # 访问的文件
                 fa = hw_delta.get('files_accessed', [])
                 if fa:
                     names = [os.path.basename(f) for f in fa[:3]]
                     suffix = f" (+{len(fa)-3}more)" if len(fa) > 3 else ""
                     hw_parts.append(f"files[{', '.join(names)}{suffix}]")
-                # 网络 I/O
+                # 网络 I/O（阈值 64 字节，过滤 asyncio 内部 Unix socket IPC 心跳包 1-2 字节噪声）
                 net_sent = hw_delta.get('net_sent_bytes', 0)
                 net_recv = hw_delta.get('net_recv_bytes', 0)
-                if net_sent > 0 or net_recv > 0:
-                    hw_parts.append(f"net {net_recv/1024:.1f}KB↓/{net_sent/1024:.1f}KB↑")
+                _NET_DISPLAY_MIN = 64
+                if net_sent >= _NET_DISPLAY_MIN or net_recv >= _NET_DISPLAY_MIN:
+                    net_src = hw_delta.get('net_bytes_source', 'process_psutil')
+                    net_src_tag = "[dim](ebpf/thread)[/dim]" if net_src == 'thread_ebpf' else "[dim](psutil)[/dim]"
+                    hw_parts.append(f"net {net_recv/1024:.1f}KB\u2193/{net_sent/1024:.1f}KB\u2191 {net_src_tag}")
                 if hw_delta['ctx_total'] > 0:
                     hw_parts.append(f"ctx {hw_delta['ctx_total']}")
                 if hw_delta['page_faults_maj'] > 0:
                     hw_parts.append(f"pgflt {hw_delta['page_faults_maj']}maj")
-                if concurrent_count > 1:
-                    hw_parts.append(f"[bold magenta]concurrent={concurrent_count}[/bold magenta]")
+                # 并发污染警告：工具执行期间 eBPF 窗口与其他工具重叠，IO/网络指标不可信
+                if hw_delta.get('ebpf_contaminated'):
+                    peak = hw_delta.get('concurrent_peak', concurrent_count)
+                    hw_parts.append(f"[bold yellow]⚠ concurrent={peak} eBPF指标不可信[/bold yellow]")
                 if hw_parts:
                     display_text += f"\n[dim]hw: {' | '.join(hw_parts)}[/dim]"
 
@@ -614,6 +650,10 @@ Ask for clarification when needed. Remember to examine test failure messages car
         self.session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         # 记录会话开始
+        # 等待 eBPF warmup 线程完成，避免 BCC 加载时的 fd 操作与 sqlite3 竞争
+        _wt = getattr(self.tracer, '_warmup_thread', None)
+        if _wt is not None and _wt.is_alive():
+            _wt.join(timeout=15)  # 最多等 15 秒
         self.tracer.event("session.start", category="lifecycle")
         self.memory.add_conversation(self.session_id, "system", "会话开始")
         self.logger.info(f"Agent 会话开始 (session_id={self.session_id})")
@@ -923,12 +963,13 @@ Ask for clarification when needed. Remember to examine test failure messages car
         
         elif cmd == "/perf":
             report = self.tracer.get_tool_hw_report()
-            conc  = self.tracer.get_concurrent_stats()
+            # 并发数显示已移除
+            # conc  = self.tracer.get_concurrent_stats()  # 已移除
             if not report:
                 return "No tool hardware metrics yet. Execute some tools first."
 
             lines = ["\U0001f4ca Tool Hardware Report (this session)\n"]
-            lines.append(f"  Peak concurrent tools: {conc['peak_concurrent']}")
+            # 峰值并发数显示已移除
             lines.append("")
 
             # 按墙上时锏合计降序排列
@@ -936,7 +977,9 @@ Ask for clarification when needed. Remember to examine test failure messages car
 
             for tool_name, hw in sorted_tools:
                 err_tag  = f" [red]\u26a0 {hw['errors']}err/{hw['error_rate_pct']:.0f}%[/red]" if hw['errors'] else ""
-                conc_tag = f" [magenta]peak_conc={hw['peak_concurrent']}[/magenta]" if hw['peak_concurrent'] > 1 else ""
+                # 并发污染警告：有 ebpf_contaminated 标记的调用次数 > 0
+                conc_calls = hw.get('concurrent_calls', 0)
+                conc_tag = f" [yellow]\u26a0 {conc_calls}/{hw['calls']}次eBPF污染(peak={hw['peak_concurrent']})[/yellow]" if conc_calls > 0 else ""
                 sample_tag = f" [yellow]\u26a0 small sample({hw['calls']})[/yellow]" if hw.get('small_sample', False) else ""
                 lines.append(f"  [bold cyan]\U0001f527 {tool_name}[/bold cyan]  calls={hw['calls']}{err_tag}{conc_tag}{sample_tag}")
                 lines.append(
@@ -949,33 +992,33 @@ Ask for clarification when needed. Remember to examine test failure messages car
                     f"min={hw['min_cpu_ms']:.1f}  max={hw['max_cpu_ms']:.1f}  "
                     f"p50={hw['p50_cpu_ms']:.1f}  p95={hw['p95_cpu_ms']:.1f}  "
                     f"cpu%={hw['cpu_pct']:.0f}%  total={hw['total_cpu_ms']:.1f}ms  "
+                    f"[dim](thread-level, CLOCK_THREAD_CPUTIME_ID)[/dim]"
                 )
-                # CPU来源标注：进程级时用黄色警告
-                if hw['cpu_source'] == 'process':
-                    lines[-1] += f" [yellow]\u26a0 src={hw['cpu_source']} (concurrent-safe)[/yellow]"
-                else:
-                    lines[-1] += f" [dim](src={hw['cpu_source']})[/dim]"
-                mem_line = (
-                    f"     Mem   \u0394rss={hw['total_mem_delta_kb']:+d}KB  "
-                    f"avg\u0394={hw['avg_mem_delta_kb']:+.1f}KB  "
-                    f"peak_rss={hw['peak_mem_rss_kb']}KB"
-                )
-                if hw['total_vms_delta_kb'] != 0:
-                    mem_line += f"  \u0394vms={hw['total_vms_delta_kb']:+d}KB"
-                if hw['total_swap_delta_kb'] != 0:
-                    mem_line += f"  \u0394swap={hw['total_swap_delta_kb']:+d}KB"
-                lines.append(mem_line)
                 io_parts = []
                 if hw['total_io_read'] or hw['total_io_write']:
                     io_parts.append(f"blk {hw['total_io_read']}r/{hw['total_io_write']}w (avg {hw['avg_io_read']:.0f}r/{hw['avg_io_write']:.0f}w)")
                 if hw['total_page_faults_min'] or hw['total_page_faults_maj']:
                     io_parts.append(f"pgflt {hw['total_page_faults_min']}min/{hw['total_page_faults_maj']}maj")
-                # 网络 I/O
-                if hw.get('total_net_sent_kb', 0) or hw.get('total_net_recv_kb', 0):
-                    io_parts.append(f"net {hw['total_net_recv_kb']:.0f}KB↓/{hw['total_net_sent_kb']:.0f}KB↑")
-                # 文件 I/O 字节数
+                # 网络 I/O（阈值 0.0625KB=64B，过滤 asyncio IPC 心跳包噪声）
+                if hw.get('total_net_sent_kb', 0) >= 0.0625 or hw.get('total_net_recv_kb', 0) >= 0.0625:
+                    net_src = hw.get('net_bytes_source', 'process_psutil')
+                    if net_src == 'thread_ebpf':
+                        net_src_tag = "[dim](ebpf/thread)[/dim]"
+                    elif net_src == 'mixed':
+                        net_src_tag = "[yellow]\u26a0(ebpf/mixed)[/yellow]"
+                    else:
+                        net_src_tag = "[dim](psutil)[/dim]"
+                    io_parts.append(f"net {hw['total_net_recv_kb']:.0f}KB\u2193/{hw['total_net_sent_kb']:.0f}KB\u2191 {net_src_tag}")
+                # 文件 I/O 字节数（eBPF 线程级）
                 if hw.get('total_io_read_kb', 0) or hw.get('total_io_write_kb', 0):
-                    io_parts.append(f"file {hw['total_io_read_kb']:.1f}KB↓/{hw['total_io_write_kb']:.1f}KB↑ (avg {hw['avg_io_read_kb']:.1f}/{hw['avg_io_write_kb']:.1f})")
+                    ebpf_src = hw.get('io_bytes_source', 'unavailable')
+                    if ebpf_src == 'thread_ebpf':
+                        src_tag = "[dim](ebpf/thread)[/dim]"
+                    elif ebpf_src == 'mixed':
+                        src_tag = "[yellow]\u26a0(ebpf/mixed)[/yellow]"
+                    else:
+                        src_tag = "[dim](unavail)[/dim]"
+                    io_parts.append(f"file {hw['total_io_read_kb']:.1f}KB\u2193/{hw['total_io_write_kb']:.1f}KB\u2191 (avg {hw['avg_io_read_kb']:.1f}/{hw['avg_io_write_kb']:.1f}) {src_tag}")
                 if io_parts:
                     lines.append(f"     IO    {' | '.join(io_parts)}")
                 # 访问的文件列表
@@ -994,13 +1037,12 @@ Ask for clarification when needed. Remember to examine test failure messages car
             total_wall  = sum(hw['total_wall_ms']      for hw in report.values())
             total_io_r  = sum(hw['total_io_read']      for hw in report.values())
             total_io_w  = sum(hw['total_io_write']     for hw in report.values())
-            total_mem   = sum(hw['total_mem_delta_kb'] for hw in report.values())
             total_errs  = sum(hw['errors']             for hw in report.values())
             cpu_pct_overall = round(total_cpu / total_wall * 100, 1) if total_wall > 0 else 0
             lines.append(
                 f"  [bold]\U0001f4c8 Session Total[/bold]  calls={total_calls}  errors={total_errs}  "
                 f"wall={total_wall:.0f}ms  cpu={total_cpu:.1f}ms ({cpu_pct_overall:.0f}%)  "
-                f"IO={total_io_r}r/{total_io_w}w  \u0394mem={total_mem:+d}KB"
+                f"IO={total_io_r}r/{total_io_w}w"
             )
             return "\n".join(lines)
         
