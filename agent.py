@@ -228,16 +228,13 @@ Ask for clarification when needed. Remember to examine test failure messages car
             
             # 初始化消息状态
             if msg_id not in _stream_state:
-                # 在消息到来时立即记录输出起始时间（用于后续 TPOT 计算）
-                output_start_time = self.tracer._now_us()
                 _stream_state[msg_id] = {
-                    'thinking': '',           # 思考内容
-                    'thinking_start_us': None,
-                    'output_start_us': output_start_time,  # 消息块到达时立即记录
-                    'last_tpot_ts_us': output_start_time,  # 上一次 TPOT 采样时间戳
+                    'thinking': '',           # 思考内容（用于面板显示）
+                    'thinking_start_us': None,# 思考开始时间（用于面板显示计时）
                     'thinking_panel_shown': False,
                     'output_offset': None,    # None=未确定, int=raw text 中 output 的起始位置
                     'text_len': 0,            # 已输出的 output 字符数
+                    'last_tpot_ts_us': None,  # 上一次 TPOT 采样时间
                 }
             state = _stream_state[msg_id]
             
@@ -254,6 +251,18 @@ Ask for clarification when needed. Remember to examine test failure messages car
             
             # === Case 1: 标准 ThinkingBlock（来自 reasoning_content 字段）===
             if current_thinking:
+                # 第一次收到 thinking token：pre_thinking → thinking
+                if self._turn_timeline.get('current_phase') == 'pre_thinking':
+                    now_us = self.tracer._now_us()
+                    pre_start = self._turn_timeline.get('phase_start_us')
+                    if pre_start and now_us > pre_start:
+                        self.tracer._add_event(
+                            "llm.pre_thinking", "X", pre_start,
+                            tid=3, cat="llm", dur=now_us - pre_start,
+                            args={"phase": "pre_thinking"}
+                        )
+                    self._turn_timeline['current_phase'] = 'thinking'
+                    self._turn_timeline['phase_start_us'] = now_us
                 if state['thinking_start_us'] is None:
                     state['thinking_start_us'] = self.tracer._now_us()
                 state['thinking'] = current_thinking
@@ -276,6 +285,18 @@ Ask for clarification when needed. Remember to examine test failure messages car
                         raw_thinking = current_text[think_start + 7:think_end].strip()
                         state['thinking'] = raw_thinking
                         if state['thinking_start_us'] is None and raw_thinking:
+                            # pre_thinking → thinking
+                            if self._turn_timeline.get('current_phase') == 'pre_thinking':
+                                now_us = self.tracer._now_us()
+                                pre_start = self._turn_timeline.get('phase_start_us')
+                                if pre_start and now_us > pre_start:
+                                    self.tracer._add_event(
+                                        "llm.pre_thinking", "X", pre_start,
+                                        tid=3, cat="llm", dur=now_us - pre_start,
+                                        args={"phase": "pre_thinking"}
+                                    )
+                                self._turn_timeline['current_phase'] = 'thinking'
+                                self._turn_timeline['phase_start_us'] = now_us
                             state['thinking_start_us'] = self.tracer._now_us()
                         # output 从 </think> 之后开始，跳过前导换行
                         after_close = current_text[think_end + 8:]  # 8 = len('</think>')
@@ -288,6 +309,18 @@ Ask for clarification when needed. Remember to examine test failure messages car
                         if raw_partial:
                             state['thinking'] = raw_partial
                         if state['thinking_start_us'] is None and raw_partial:
+                            # pre_thinking → thinking
+                            if self._turn_timeline.get('current_phase') == 'pre_thinking':
+                                now_us = self.tracer._now_us()
+                                pre_start = self._turn_timeline.get('phase_start_us')
+                                if pre_start and now_us > pre_start:
+                                    self.tracer._add_event(
+                                        "llm.pre_thinking", "X", pre_start,
+                                        tid=3, cat="llm", dur=now_us - pre_start,
+                                        args={"phase": "pre_thinking"}
+                                    )
+                                self._turn_timeline['current_phase'] = 'thinking'
+                                self._turn_timeline['phase_start_us'] = now_us
                             state['thinking_start_us'] = self.tracer._now_us()
                         output_text = ''  # 思考未结束，暂不输出
                 else:
@@ -304,7 +337,7 @@ Ask for clarification when needed. Remember to examine test failure messages car
                 state['thinking_panel_shown'] = True
                 thinking_text = state['thinking']
                 thinking_chars = len(thinking_text)
-                thinking_end_us = state['output_start_us'] or self.tracer._now_us()
+                thinking_end_us = self._turn_timeline.get('output_start_us') or self.tracer._now_us()
                 thinking_time_s = (
                     (thinking_end_us - state['thinking_start_us']) / 1_000_000
                     if state['thinking_start_us'] else 0
@@ -340,10 +373,26 @@ Ask for clarification when needed. Remember to examine test failure messages car
                     sys.stdout.write(delta_text)
                     sys.stdout.flush()
                     state['text_len'] = len(output_text)
-                    
-                    # 每次有新增输出时记录一次 TPOT 采样点（用于 timeline 折线）
+            
+                    # 第一次有 output：结束 pre_thinking 或 thinking，开始 output
+                    if self._turn_timeline.get('current_phase') in ('pre_thinking', 'thinking'):
+                        now_us = self.tracer._now_us()
+                        cur_phase = self._turn_timeline['current_phase']
+                        phase_start = self._turn_timeline.get('phase_start_us')
+                        if phase_start and now_us > phase_start:
+                            self.tracer._add_event(
+                                f"llm.{cur_phase}", "X", phase_start,
+                                tid=3, cat="llm", dur=now_us - phase_start,
+                                args={"phase": cur_phase}
+                            )
+                        self._turn_timeline['current_phase'] = 'output'
+                        self._turn_timeline['phase_start_us'] = now_us
+                        self._turn_timeline['output_start_us'] = now_us
+            
+                    # 每次有新增输出时记录一次 TPOT 采样点
                     now_us = self.tracer._now_us()
-                    delta_us = now_us - state.get('last_tpot_ts_us', now_us)
+                    last_ts = state.get('last_tpot_ts_us') or self._turn_timeline.get('output_start_us') or now_us
+                    delta_us = now_us - last_ts
                     delta_tokens = self._count_output_tokens(delta_text)
                     if delta_us > 0 and delta_tokens > 0:
                         tpot_ms = (delta_us / 1000.0) / delta_tokens
@@ -357,30 +406,10 @@ Ask for clarification when needed. Remember to examine test failure messages car
                         )
                         state['last_tpot_ts_us'] = now_us
             
-            # === 最后一条消息：清理状态，记录时间戳，补换行 ===
+            # === 最后一条消息：清理状态，补换行 ===
             if last:
                 if msg_id in _stream_state:
                     s = _stream_state.pop(msg_id)
-                    # 将 thinking/output 时间戳写入 turn_timeline 供 trace 使用
-                    if s.get('thinking_start_us'):
-                        self._turn_timeline['thinking_start_us'] = s['thinking_start_us']
-                        self._turn_timeline['thinking_end_us'] = (
-                            s.get('output_start_us') or self.tracer._now_us()
-                        )
-                    # 记录 output 开始时间戳（用于 TPOT 计算）
-                    if s.get('output_start_us'):
-                        self._turn_timeline['output_start_us'] = s['output_start_us']
-
-                    # 每轮结束时补一个 TPOT=0 的收尾点，便于 timeline 标记轮次结束
-                    self.tracer._add_event(
-                        name="llm.output.tpot",
-                        ph="C",
-                        ts=self.tracer._now_us(),
-                        tid=3,
-                        cat="llm",
-                        args={"tpot_ms": 0.0},
-                    )
-                    
                     if s['text_len'] > 0 or s['thinking']:
                         sys.stdout.write("\n")
                         sys.stdout.flush()
@@ -417,15 +446,16 @@ Ask for clarification when needed. Remember to examine test failure messages car
         logger = self.logger
         tracer = self.tracer
 
-        # 追踪turn内的时间线，用于推断LLM推理阶段（使用实例变量）
+        # 实时阶段状态机：取代事后推断，每次 phase 变化时立即发出 X 事件
+        # 状态转换：pre_thinking → (thinking →) output，工具调用结束后回到 pre_thinking
         self._turn_timeline = {
             'turn_start': None,
             'last_event_end': None,
             'llm_spans': [],   # 记录LLM推理阶段
             'tool_spans': [],  # 记录工具调用阶段
-            'thinking_start_us': None,  # LLM思考阶段开始时间戳
-            'thinking_end_us': None,    # LLM思考阶段结束（=输出阶段开始）时间戳
-            'output_start_us': None,    # LLM输出阶段开始时间戳
+            'current_phase': None,     # 当前 LLM 阶段: 'pre_thinking'|'thinking'|'output'|None
+            'phase_start_us': None,    # 当前阶段开始时间（状态机驱动）
+            'output_start_us': None,   # output 阶段开始时间（用于 TPOT 统计）
         }
 
         async def tool_display_middleware(kwargs, next_handler):
@@ -462,54 +492,19 @@ Ask for clarification when needed. Remember to examine test failure messages car
             hw_before = tracer._hw_snapshot()
             span_ts = tracer._now_us()  # 记录span开始时间
             had_error = False
-            
-            # 检查是否需要记录LLM推理阶段（工具调用前的间隙）
-            if self._turn_timeline['last_event_end'] is not None:
-                gap_start = self._turn_timeline['last_event_end']
-                gap_end_us = span_ts
-                gap_duration_us = gap_end_us - gap_start
-                
-                if gap_duration_us > 50_000:  # 50ms
-                    t_start = self._turn_timeline.get('thinking_start_us')
-                    t_end   = self._turn_timeline.get('thinking_end_us')
-                    
-                    if t_start and t_end and t_start >= gap_start:
-                        # 有 thinking 阶段：拆分为 pre_thinking + thinking + output
-                        pre_gap = t_start - gap_start
-                        if pre_gap > 50_000:
-                            tracer._add_event(
-                                "llm.pre_thinking", "X", gap_start,
-                                tid=3, cat="llm", dur=pre_gap,
-                                args={"inferred": True, "gap_before_tool": tool_name, "phase": "pre_thinking"}
-                            )
-                        think_dur = t_end - t_start
-                        if think_dur > 0:
-                            tracer._add_event(
-                                "llm.thinking", "X", t_start,
-                                tid=3, cat="llm", dur=think_dur,
-                                args={"inferred": True, "gap_before_tool": tool_name, "phase": "thinking"}
-                            )
-                        output_dur = gap_end_us - t_end
-                        if output_dur > 50_000:
-                            tracer._add_event(
-                                "llm.output", "X", t_end,
-                                tid=3, cat="llm", dur=output_dur,
-                                args={"inferred": True, "gap_before_tool": tool_name, "phase": "output"}
-                            )
-                        # 记录后重置，避免影响后续轮次
-                        self._turn_timeline['thinking_start_us'] = None
-                        self._turn_timeline['thinking_end_us'] = None
-                    else:
-                        # 无 thinking 信息，整个计为 reasoning
-                        tracer._add_event(
-                            "llm.reasoning", "X", gap_start,
-                            tid=3, cat="llm", dur=gap_duration_us,
-                            args={"inferred": True, "gap_before_tool": tool_name}
-                        )
-                    self._turn_timeline['llm_spans'].append({
-                        'start': gap_start,
-                        'duration_us': gap_duration_us
-                    })
+
+            # 结束当前 LLM 阶段（实时状态机）
+            cur_phase = self._turn_timeline.get('current_phase')
+            phase_start = self._turn_timeline.get('phase_start_us')
+            if cur_phase and phase_start and span_ts > phase_start:
+                tracer._add_event(
+                    f"llm.{cur_phase}", "X", phase_start,
+                    tid=3, cat="llm", dur=span_ts - phase_start,
+                    args={"phase": cur_phase, "gap_before_tool": tool_name}
+                )
+                self._turn_timeline['llm_spans'].append({
+                    'start': phase_start, 'duration_us': span_ts - phase_start
+                })
             
             try:
                 async for response in await next_handler(**kwargs):
@@ -552,8 +547,12 @@ Ask for clarification when needed. Remember to examine test failure messages car
                     args={**tool_input, 'hw': hw_delta}
                 )
                 
-                # 更新时间线
-                self._turn_timeline['last_event_end'] = span_ts + dur_us
+                # 更新时间线：工具结束后开始新的 pre_thinking 阶段
+                tool_end_us = span_ts + dur_us
+                self._turn_timeline['last_event_end'] = tool_end_us
+                self._turn_timeline['current_phase'] = 'pre_thinking'
+                self._turn_timeline['phase_start_us'] = tool_end_us
+                self._turn_timeline['output_start_us'] = None  # 重置，下一轮 output 时重新设置
                 self._turn_timeline['tool_spans'].append({
                     'name': tool_name,
                     'start': span_ts,
@@ -710,14 +709,15 @@ Ask for clarification when needed. Remember to examine test failure messages car
                 self.console.print("")
                 self.console.print(Rule("[bold magenta]🤖 Assistant[/bold magenta]", style="magenta"))
                 
-                # 重置 turn 时间线
-                self._turn_timeline['turn_start'] = self.tracer._now_us()
-                self._turn_timeline['last_event_end'] = self._turn_timeline['turn_start']
+                # 重置 turn 时间线，开始 pre_thinking 阶段
+                turn_start_us = self.tracer._now_us()
+                self._turn_timeline['turn_start'] = turn_start_us
+                self._turn_timeline['last_event_end'] = turn_start_us
                 self._turn_timeline['llm_spans'] = []
                 self._turn_timeline['tool_spans'] = []
-                self._turn_timeline['thinking_start_us'] = None  # 每轮重置
-                self._turn_timeline['thinking_end_us'] = None    # 每轮重置
-                self._turn_timeline['output_start_us'] = None    # 每轮重置
+                self._turn_timeline['current_phase'] = 'pre_thinking'
+                self._turn_timeline['phase_start_us'] = turn_start_us
+                self._turn_timeline['output_start_us'] = None
                 
                 async with self.tracer.async_span(turn_name, category="turn", input=user_input[:80]):
                     # 刷新记忆上下文到 system prompt（确保运行期间新增的记忆也能用上）
@@ -733,45 +733,16 @@ Ask for clarification when needed. Remember to examine test failure messages car
                     # 调用 AgentScope agent
                     response = await self.agent(user_msg)
                     
-                    # turn结束：将最终 LLM 推理阶段拆分为 thinking + output 两段
+                    # turn 结束：结束当前正在进行的 LLM 阶段
                     turn_end_us = self.tracer._now_us()
-                    if self._turn_timeline['last_event_end'] is not None:
-                        final_gap = turn_end_us - self._turn_timeline['last_event_end']
-                        if final_gap > 50_000:  # 50ms
-                            llm_start = self._turn_timeline['last_event_end']
-                            thinking_start = self._turn_timeline.get('thinking_start_us')
-                            thinking_end   = self._turn_timeline.get('thinking_end_us')
-
-                            if thinking_start and thinking_end and thinking_start >= llm_start:
-                                # 有 thinking 阶段：分三段记录
-                                pre_gap = thinking_start - llm_start
-                                if pre_gap > 50_000:
-                                    self.tracer._add_event(
-                                        "llm.pre_thinking", "X", llm_start,
-                                        tid=3, cat="llm", dur=pre_gap,
-                                        args={"inferred": True, "phase": "pre_thinking"}
-                                    )
-                                think_dur = thinking_end - thinking_start
-                                if think_dur > 0:
-                                    self.tracer._add_event(
-                                        "llm.thinking", "X", thinking_start,
-                                        tid=3, cat="llm", dur=think_dur,
-                                        args={"inferred": True, "phase": "thinking"}
-                                    )
-                                output_dur = turn_end_us - thinking_end
-                                if output_dur > 50_000:
-                                    self.tracer._add_event(
-                                        "llm.output", "X", thinking_end,
-                                        tid=3, cat="llm", dur=output_dur,
-                                        args={"inferred": True, "phase": "output"}
-                                    )
-                            else:
-                                # 无 thinking 阶段：整个计为 reasoning
-                                self.tracer._add_event(
-                                    "llm.reasoning", "X", llm_start,
-                                    tid=3, cat="llm", dur=final_gap,
-                                    args={"inferred": True, "phase": "final_response"}
-                                )
+                    cur_phase = self._turn_timeline.get('current_phase')
+                    phase_start = self._turn_timeline.get('phase_start_us')
+                    if cur_phase and phase_start and turn_end_us > phase_start:
+                        self.tracer._add_event(
+                            f"llm.{cur_phase}", "X", phase_start,
+                            tid=3, cat="llm", dur=turn_end_us - phase_start,
+                            args={"phase": cur_phase}
+                        )
                     
                     # 保存助手回复到记忆系统
                     if response and response.content:
