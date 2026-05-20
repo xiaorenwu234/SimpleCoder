@@ -59,15 +59,13 @@ class Agent:
         self._initialized = False
         # Load environment
         load_dotenv()
-        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
-        api_base = os.getenv("OPENAI_API_BASE") or os.getenv(
+        self.api_key = os.getenv("OPENAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+        self.api_base = os.getenv("OPENAI_API_BASE") or os.getenv(
             "DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1"
         )
-        api_base="http://localhost:8001/v1"
-        api_key="sk-xxx"
-        model_name = os.getenv("MODEL_NAME", "/home/xueht26/Qwen3-8B")
+        self.model_name = os.getenv("MODEL_NAME", "qwen-plus")
 
-        if not api_key:
+        if not self.api_key:
             raise RuntimeError(
                 "Missing OPENAI_API_KEY or DASHSCOPE_API_KEY in environment. Set it in .env or your shell."
             )
@@ -84,6 +82,16 @@ class Agent:
         
         # 初始化 Trace 追踪器
         self.tracer = get_tracer()
+
+        # LLM 输出性能统计（TPOT = output_ms / output_tokens）
+        self._llm_perf_stats = {
+            'turns': 0,
+            'total_output_tokens': 0,
+            'total_output_ms': 0.0,
+            'total_thinking_ms': 0.0,
+            'tpot_ms_values': [],
+            'last_tpot_ms': None,
+        }
         
         # 设置日志
         logging.basicConfig(
@@ -177,27 +185,11 @@ Ask for clarification when needed. Remember to examine test failure messages car
         if memory_context:
             system_prompt += f"\n\n## Session Context:\n{memory_context}"
 
-        # 判断使用的 API 类型
-        api_base = os.getenv("OPENAI_API_BASE") or os.getenv("DASHSCOPE_API_BASE", "")
-        is_dashscope = "dashscope" in api_base.lower() if api_base else True
-        
-        # self.model = OpenAIChatModel(
-        #         model_name="/home/xueht26/Qwen3-8B",
-        #         api_key="sk-xxx",
-        #         client_kwargs={
-        #             "base_url": "http://localhost:8001/v1",
-        #         },
-        #         generate_kwargs={
-        #             "parallel_tool_calls": True,
-        #         },
-        #     )
-        # formatter = OpenAIChatFormatter()
-        
         self.model = OpenAIChatModel(
-                model_name="qwen3.5-flash",
-                api_key="sk-042148052b534517b8bdd2ab37059848",
+                model_name=self.model_name,
+                api_key=self.api_key,
                 client_kwargs={
-                    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    "base_url": self.api_base,
                 },
                 generate_kwargs={
                     "parallel_tool_calls": True,
@@ -236,10 +228,13 @@ Ask for clarification when needed. Remember to examine test failure messages car
             
             # 初始化消息状态
             if msg_id not in _stream_state:
+                # 在消息到来时立即记录输出起始时间（用于后续 TPOT 计算）
+                output_start_time = self.tracer._now_us()
                 _stream_state[msg_id] = {
                     'thinking': '',           # 思考内容
                     'thinking_start_us': None,
-                    'output_start_us': None,
+                    'output_start_us': output_start_time,  # 消息块到达时立即记录
+                    'last_tpot_ts_us': output_start_time,  # 上一次 TPOT 采样时间戳
                     'thinking_panel_shown': False,
                     'output_offset': None,    # None=未确定, int=raw text 中 output 的起始位置
                     'text_len': 0,            # 已输出的 output 字符数
@@ -282,8 +277,6 @@ Ask for clarification when needed. Remember to examine test failure messages car
                         state['thinking'] = raw_thinking
                         if state['thinking_start_us'] is None and raw_thinking:
                             state['thinking_start_us'] = self.tracer._now_us()
-                        if state['output_start_us'] is None:
-                            state['output_start_us'] = self.tracer._now_us()
                         # output 从 </think> 之后开始，跳过前导换行
                         after_close = current_text[think_end + 8:]  # 8 = len('</think>')
                         stripped = len(after_close) - len(after_close.lstrip('\n'))
@@ -300,10 +293,6 @@ Ask for clarification when needed. Remember to examine test failure messages car
                 else:
                     # 已知 output 起始位置，直接切片
                     output_text = current_text[state['output_offset']:]
-            
-            # === 记录 output 开始时间戳 ===
-            if output_text and state['output_start_us'] is None:
-                state['output_start_us'] = self.tracer._now_us()
             
             # === 展示 thinking 面板（thinking 完成时，即将开始 output）===
             should_show_thinking = (
@@ -347,9 +336,26 @@ Ask for clarification when needed. Remember to examine test failure messages car
             if output_text:
                 prev_len = state['text_len']
                 if len(output_text) > prev_len:
-                    sys.stdout.write(output_text[prev_len:])
+                    delta_text = output_text[prev_len:]
+                    sys.stdout.write(delta_text)
                     sys.stdout.flush()
                     state['text_len'] = len(output_text)
+                    
+                    # 每次有新增输出时记录一次 TPOT 采样点（用于 timeline 折线）
+                    now_us = self.tracer._now_us()
+                    delta_us = now_us - state.get('last_tpot_ts_us', now_us)
+                    delta_tokens = self._count_output_tokens(delta_text)
+                    if delta_us > 0 and delta_tokens > 0:
+                        tpot_ms = (delta_us / 1000.0) / delta_tokens
+                        self.tracer._add_event(
+                            name="llm.output.tpot",
+                            ph="C",
+                            ts=now_us,
+                            tid=3,
+                            cat="llm",
+                            args={"tpot_ms": round(tpot_ms, 4)},
+                        )
+                        state['last_tpot_ts_us'] = now_us
             
             # === 最后一条消息：清理状态，记录时间戳，补换行 ===
             if last:
@@ -361,6 +367,20 @@ Ask for clarification when needed. Remember to examine test failure messages car
                         self._turn_timeline['thinking_end_us'] = (
                             s.get('output_start_us') or self.tracer._now_us()
                         )
+                    # 记录 output 开始时间戳（用于 TPOT 计算）
+                    if s.get('output_start_us'):
+                        self._turn_timeline['output_start_us'] = s['output_start_us']
+
+                    # 每轮结束时补一个 TPOT=0 的收尾点，便于 timeline 标记轮次结束
+                    self.tracer._add_event(
+                        name="llm.output.tpot",
+                        ph="C",
+                        ts=self.tracer._now_us(),
+                        tid=3,
+                        cat="llm",
+                        args={"tpot_ms": 0.0},
+                    )
+                    
                     if s['text_len'] > 0 or s['thinking']:
                         sys.stdout.write("\n")
                         sys.stdout.flush()
@@ -405,6 +425,7 @@ Ask for clarification when needed. Remember to examine test failure messages car
             'tool_spans': [],  # 记录工具调用阶段
             'thinking_start_us': None,  # LLM思考阶段开始时间戳
             'thinking_end_us': None,    # LLM思考阶段结束（=输出阶段开始）时间戳
+            'output_start_us': None,    # LLM输出阶段开始时间戳
         }
 
         async def tool_display_middleware(kwargs, next_handler):
@@ -696,6 +717,7 @@ Ask for clarification when needed. Remember to examine test failure messages car
                 self._turn_timeline['tool_spans'] = []
                 self._turn_timeline['thinking_start_us'] = None  # 每轮重置
                 self._turn_timeline['thinking_end_us'] = None    # 每轮重置
+                self._turn_timeline['output_start_us'] = None    # 每轮重置
                 
                 async with self.tracer.async_span(turn_name, category="turn", input=user_input[:80]):
                     # 刷新记忆上下文到 system prompt（确保运行期间新增的记忆也能用上）
@@ -754,6 +776,8 @@ Ask for clarification when needed. Remember to examine test failure messages car
                     # 保存助手回复到记忆系统
                     if response and response.content:
                         resp_text = self._extract_response_text(response)
+                        # 记录 LLM TPOT（Time Per Output Token）
+                        self._record_llm_tpot(resp_text, turn_end_us)
                         if resp_text:
                             self.memory.add_conversation(self.session_id, "assistant", resp_text[:500])
                     
@@ -784,6 +808,51 @@ Ask for clarification when needed. Remember to examine test failure messages car
                 )
             except Exception as e:
                 self.logger.warning(f"保存 trace 失败: {e}")
+
+    def _count_output_tokens(self, text: str) -> int:
+        """统计输出 token 数。优先使用 CharTokenCounter，失败时回退到字符长度。"""
+        if not text:
+            return 0
+
+        try:
+            counter = CharTokenCounter()
+            return int(counter.count(text))
+        except Exception:
+            # 回退策略：将字符数作为近似 token 数
+            return len(text)
+
+    def _record_llm_tpot(self, response_text: str, turn_end_us: int) -> None:
+        """基于当前轮时间线记录 LLM TPOT 统计（累积聚合用）。
+        
+        注意：详细的 TPOT metric 已在流式处理时逐块记录到 timeline 中，
+        此函数主要用于更新统计和计算百分位数。
+        """
+        try:
+            output_start_us = self._turn_timeline.get('output_start_us')
+            if not output_start_us or turn_end_us <= output_start_us:
+                return
+
+            output_tokens = self._count_output_tokens(response_text)
+            if output_tokens <= 0:
+                return
+
+            output_ms = (turn_end_us - output_start_us) / 1000.0
+            tpot_ms = output_ms / output_tokens
+
+            thinking_ms = 0.0
+            t_start = self._turn_timeline.get('thinking_start_us')
+            t_end = self._turn_timeline.get('thinking_end_us')
+            if t_start and t_end and t_end > t_start:
+                thinking_ms = (t_end - t_start) / 1000.0
+
+            self._llm_perf_stats['turns'] += 1
+            self._llm_perf_stats['total_output_tokens'] += output_tokens
+            self._llm_perf_stats['total_output_ms'] += output_ms
+            self._llm_perf_stats['total_thinking_ms'] += thinking_ms
+            self._llm_perf_stats['tpot_ms_values'].append(round(tpot_ms, 4))
+            self._llm_perf_stats['last_tpot_ms'] = round(tpot_ms, 4)
+        except Exception as e:
+            self.logger.debug(f"记录 TPOT 失败: {e}")
     
     def _build_memory_context(self) -> str:
         """构建记忆上下文,注入到 system prompt"""
@@ -963,13 +1032,43 @@ Ask for clarification when needed. Remember to examine test failure messages car
         
         elif cmd == "/perf":
             report = self.tracer.get_tool_hw_report()
-            # 并发数显示已移除
-            # conc  = self.tracer.get_concurrent_stats()  # 已移除
-            if not report:
-                return "No tool hardware metrics yet. Execute some tools first."
 
             lines = ["\U0001f4ca Tool Hardware Report (this session)\n"]
-            # 峰值并发数显示已移除
+            llm_stats = self._llm_perf_stats
+            has_llm_tpot = llm_stats['turns'] > 0 and llm_stats['total_output_tokens'] > 0
+
+            if not report and not has_llm_tpot:
+                return "No performance metrics yet. Execute some tools and ask at least one question first."
+
+            lines = ["\U0001f4ca Performance Report (this session)\n"]
+
+            if has_llm_tpot:
+                total_tokens = llm_stats['total_output_tokens']
+                total_output_ms = llm_stats['total_output_ms']
+                avg_tpot_ms = total_output_ms / total_tokens if total_tokens > 0 else 0
+                avg_tps = 1000.0 / avg_tpot_ms if avg_tpot_ms > 0 else 0
+                last_tpot_ms = llm_stats['last_tpot_ms'] or 0
+                tpot_values = sorted(llm_stats['tpot_ms_values'])
+                p50_tpot = self.tracer._percentile(tpot_values, 50) if tpot_values else 0
+                p95_tpot = self.tracer._percentile(tpot_values, 95) if tpot_values else 0
+                total_thinking_ms = llm_stats['total_thinking_ms']
+                lines.append("  [bold green]🧠 LLM Output Metrics[/bold green]")
+                lines.append(
+                    f"     turns={llm_stats['turns']}  output_tokens={total_tokens}  "
+                    f"output_time={total_output_ms:.0f}ms  thinking_time={total_thinking_ms:.0f}ms"
+                )
+                lines.append(
+                    f"     TPOT  avg={avg_tpot_ms:.2f}ms/token  last={last_tpot_ms:.2f}  "
+                    f"p50={p50_tpot:.2f}  p95={p95_tpot:.2f}"
+                )
+                lines.append(f"     Throughput avg={avg_tps:.2f} tokens/s")
+                lines.append("")
+
+            if not report:
+                return "\n".join(lines)
+
+            lines.append("  [bold cyan]🔧 Tool Hardware Metrics[/bold cyan]")
+            lines.append(f"  Peak concurrent tools: {conc['peak_concurrent']}")
             lines.append("")
 
             # 按墙上时锏合计降序排列
